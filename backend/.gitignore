@@ -1,0 +1,21 @@
+# Ignore data and migrations directories
+data/
+migrations/
+ 
+# Python virtual environment
+venv/
+env/
+.env
+ 
+# Python compilation files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+ 
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+ 
+ 
