@@ -1995,6 +1995,13 @@ def screen_job(db: Session, job_id: UUID) -> dict:
 
         print(f"[SEARCH] Structured search returned {len(candidate_ids)} candidates")
 
+        if candidate_ids:
+            s_cands = db.scalars(select(Candidate).where(Candidate.id.in_(candidate_ids))).all()
+            print("\n--- Candidates Passing Structured Search ---")
+            for c in s_cands:
+                print(f"Candidate Name: {c.name}")
+            print("--------------------------------------------\n")
+
         # =====================================================
         # STEP 2 — FTS
         # =====================================================
@@ -2002,6 +2009,13 @@ def screen_job(db: Session, job_id: UUID) -> dict:
             candidate_ids = fts_candidate_search(db, req, candidate_ids)
 
         print(f"[SEARCH] FTS returned {len(candidate_ids)} candidates")
+
+        if candidate_ids:
+            f_cands = db.scalars(select(Candidate).where(Candidate.id.in_(candidate_ids))).all()
+            print("\n--- Candidates Passing FTS Search ---")
+            for c in f_cands:
+                print(f"Candidate Name: {c.name}")
+            print("-------------------------------------\n")
 
         if not candidate_ids:
             print("No candidates found after search. Exiting.")
@@ -2022,6 +2036,7 @@ def screen_job(db: Session, job_id: UUID) -> dict:
         candidates = db.scalars(
             select(Candidate).where(Candidate.id.in_(candidate_ids))
         ).all()
+
         candidate_map: dict = {c.id: c for c in candidates}
 
         all_skills = db.scalars(
