@@ -38,6 +38,11 @@ from .models import (
     AIExtractionLog,
     CandidateContact,
 )
+from .skill_tree import (
+    normalize_skill_from_tree,
+    resolve_canonical,
+    get_fts_expansion_terms,
+)
 
 OPENAI_API_KEY = settings.OPENAI_API_KEY
 
@@ -233,13 +238,19 @@ def file_hash(path: str) -> str:
 # ------------------------------------------------------------
 # AI EXTRACTION
 # ------------------------------------------------------------
-def _json_completion(prompt: str, model: str) -> dict:
+def _json_completion(prompt: str, model: str, max_tokens: int | None = None) -> dict:
     """Input: prompt/model. Output: validated JSON object returned by the configured LLM."""
-    response = openai_client.chat.completions.create(
-        model=model,
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": "Return only valid JSON."}, {"role": "user", "content": prompt}],
-    )
+    kwargs: dict = {
+        "model": model,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": "Return only valid JSON."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    response = openai_client.chat.completions.create(**kwargs)
     return json.loads(response.choices[0].message.content)
 
 def extract_jd(text: str) -> dict:
@@ -270,55 +281,34 @@ CV:\n{text[:30000]}
 
 def normalize_skill(name: str) -> tuple[str, str | None, str | None]:
     """
-    Normalize a candidate skill while preserving the original specific technology.
+    Normalize a candidate skill using the full skill taxonomy in skill_tree.py.
+
+    Delegates entirely to normalize_skill_from_tree() which:
+      1. Resolves aliases (e.g. "NodeJS" -> "Node.js", "sklearn" -> "Scikit-learn")
+      2. Looks up the canonical parent via CANONICAL_PARENT (deterministic, no ambiguity)
+      3. Falls back to implied parents from SKILL_TREE inversion
+      4. Resolves display-case names and top-level category
 
     Input:
-        name -> Skill name.
+        name -> Raw skill string from CV / JD
 
     Output:
-        Tuple containing:
-        - normalized skill
-        - parent skill
-        - skill category
+        Tuple of:
+        - normalized display name  (e.g. "React", "Node.js", "Scikit-learn")
+        - parent skill display name (e.g. "JavaScript", "Python") or None
+        - skill category display   (e.g. "Frontend", "Backend", "AI & ML") or None
 
-    Example:
-        Django -> Django, Python, Backend
-        DRF -> Django REST Framework, Django, Backend
+    Examples:
+        "ReactJS"      -> ("React",       "JavaScript",      "Frontend")
+        "NodeJS"       -> ("Node.js",      "JavaScript",      "Frontend")
+        "Spring Boot"  -> ("Spring Boot",  "Java",            "Backend")
+        "K8s"          -> ("Kubernetes",   "DevOps",          "Cloud & DevOps")
+        "sklearn"      -> ("Scikit-learn", "Machine Learning","AI & ML")
+        "Postgres"     -> ("PostgreSQL",   "SQL",             "Data & Databases")
+        "DRF"          -> ("DRF",          "Django",          "Backend")
+        "Unknown Tool" -> ("Unknown Tool", None,              None)
     """
-
-    if name is None:
-        return "", None, None
-
-    raw = str(name).strip()
-
-    if not raw:
-        return "", None, None
-
-    low = raw.lower()
-
-    relationships = {
-        "django": ("Django", "Python", "Backend"),
-        "django rest framework": (
-            "Django REST Framework",
-            "Django",
-            "Backend"
-        ),
-        "drf": (
-            "Django REST Framework",
-            "Django",
-            "Backend"
-        ),
-        "flask": ("Flask", "Python", "Backend"),
-        "fastapi": ("FastAPI", "Python", "Backend"),
-        "spring boot": ("Spring Boot", "Java", "Backend"),
-        "react.js": ("React", "JavaScript", "Frontend"),
-        "react": ("React", "JavaScript", "Frontend"),
-    }
-
-    if low in relationships:
-        return relationships[low]
-
-    return raw, None, None
+    return normalize_skill_from_tree(name)
 
 def safe_list(value) -> list:
     """
@@ -1365,6 +1355,9 @@ def exact_skill_match(db: Session, candidate_id: UUID, required: list) -> dict:
     for req in required_names:
  
         required_skill = str(req).strip().lower()
+        # Resolve aliases on the JD side too so that "NodeJS" matches
+        # a candidate whose normalized_skill_name is "node.js" / "nodejs".
+        required_skill_canonical = resolve_canonical(required_skill)
  
         status = "MISSING"
 
@@ -1373,12 +1366,18 @@ def exact_skill_match(db: Session, candidate_id: UUID, required: list) -> dict:
         # ---------------------------------------------------------
 
         # 1. EXACT NORMALIZED MATCH
+        # Tries both the raw lowercased form and the resolved canonical
+        # so that alias variants on either side are caught.
 
         # ---------------------------------------------------------
 
         for candidate in candidate_skills:
  
-            if required_skill == candidate["normalized"]:
+            candidate_ck = resolve_canonical(candidate["normalized"])
+            if (
+                required_skill == candidate["normalized"]
+                or required_skill_canonical == candidate_ck
+            ):
 
                 status = "EXACT"
 
@@ -1396,19 +1395,18 @@ def exact_skill_match(db: Session, candidate_id: UUID, required: list) -> dict:
  
             for candidate in candidate_skills:
  
-                if (
+                if candidate["parent"]:
+                    parent_ck = resolve_canonical(candidate["parent"])
+                    if (
+                        required_skill == candidate["parent"]
+                        or required_skill_canonical == parent_ck
+                    ):
 
-                    candidate["parent"]
+                        status = "PARENT_SUPPORT"
 
-                    and required_skill == candidate["parent"]
+                        matched_skill_name = candidate["original"]
 
-                ):
-
-                    status = "PARENT_SUPPORT"
-
-                    matched_skill_name = candidate["original"]
-
-                    break
+                        break
  
         # Only exact matches count
 
@@ -1578,6 +1576,20 @@ def fts_candidate_search(
         # No searchable terms — return full pool unchanged.
         return candidate_ids
 
+    # Expand each term with known aliases so that a JD saying "React" also
+    # matches resumes that say "ReactJS" or "React.js", etc.
+    expanded_terms: list[str] = []
+    for term in search_terms:
+        expanded_terms.extend(get_fts_expansion_terms(term))
+
+    # Deduplicate while preserving order
+    seen_terms: set[str] = set()
+    unique_terms: list[str] = []
+    for t in expanded_terms:
+        if t.lower() not in seen_terms:
+            seen_terms.add(t.lower())
+            unique_terms.append(t)
+
     # Build an OR-based FTS query so a candidate matches if ANY skill appears,
     # not ALL of them. This avoids zero results when skills are diverse.
     # Each term is sanitised and joined with the | (OR) operator.
@@ -1586,10 +1598,10 @@ def fts_candidate_search(
         return re.sub(r"[^\w\s]", " ", t).strip()
 
     or_terms = []
-    for term in search_terms:
+    for term in unique_terms:
         cleaned = _clean_term(term)
         if cleaned:
-            # Multi-word skill (e.g. "Machine Learning") → phrase match.
+            # Multi-word skill (e.g. "Machine Learning") -> phrase match.
             words = cleaned.split()
             if len(words) > 1:
                 or_terms.append(" <-> ".join(words))
@@ -1633,31 +1645,33 @@ def fts_candidate_search(
 
 
 # ------------------------------------------------------------
-# GPT EVALUATION
+# GPT EVALUATION (COMMENTED OUT)
 # ------------------------------------------------------------
-def ai_score_candidate(payload: dict) -> dict:
-    """Output: precisely 8 numerical scores and reasoning string."""
-    prompt = f"""
-You are an expert AI Recruiter evaluating a candidate against a job description.
-Assign precise numerical scores for each of the following 8 criteria, adhering strictly to the maximum points allowed for each.
-
-Criteria & Maximum Points:
-1. mandatory_skills_score: max 30
-2. experience_score: max 25
-3. domain_score: max 15
-4. preferred_skills_score: max 10
-5. education_score: max 5
-6. location_score: max 5
-7. availability_score: max 5
-8. other_requirements_score: max 5
-
-Rules:
-- Be realistic and precise. Give partial points if they partially meet a requirement.
-- If the JD does not mention a requirement (e.g., no location specified), award full points for that category.
-- Output ONLY a JSON object with EXACTLY the keys listed above (as numbers), plus a string key 'reasoning' explaining the scores briefly.
-DATA:\n{json.dumps(payload, default=str)}
-"""
-    return _json_completion(prompt, settings.EVALUATION_MODEL)
+# def ai_score_candidate(payload: dict) -> dict:
+#     """Output: precisely 8 numerical scores and reasoning string."""
+#     prompt = f"""
+# You are an expert AI Recruiter evaluating a candidate against a job description.
+# Assign precise numerical scores for each of the following 8 criteria, adhering strictly to the maximum points allowed for each.
+# 
+# Criteria & Maximum Points:
+# 1. mandatory_skills_score: max 30
+# 2. experience_score: max 25
+# 3. domain_score: max 15
+# 4. preferred_skills_score: max 10
+# 5. education_score: max 5
+# 6. location_score: max 5
+# 7. availability_score: max 5
+# 8. other_requirements_score: max 5
+# 
+# Rules:
+# - Be realistic and precise. Give partial points if they partially meet a requirement.
+# - If the JD does not mention a requirement (e.g., no location specified), award full points for that category.
+# - Output ONLY a JSON object with EXACTLY the keys listed above (as numbers), plus a string key 'reasoning' explaining the scores briefly.
+# DATA:\n{json.dumps(payload, default=str)}
+# """
+#     # max_tokens=350 is enough for 8 numbers + short reasoning; prevents the
+#     # model from generating unnecessarily long output which adds latency.
+#     return _json_completion(prompt, settings.EVALUATION_MODEL, max_tokens=350)
 
 # ------------------------------------------------------------
 # DETERMINISTIC SCORING
@@ -2075,146 +2089,95 @@ def screen_job(db: Session, job_id: UUID) -> dict:
                 print(f"Normal scoring failed for {cid}: {error}")
 
         # =====================================================
-        # STEP 5 — SORT & SLICE TOP 30
+        # STEP 5 — SORT DETERMINISTICALLY SCORED CANDIDATES
         # =====================================================
         normal_ranked.sort(key=lambda item: item[1]["total_score"], reverse=True)
-        top_30 = normal_ranked[:30]
 
         print(
-            f"[SCORING] {len(normal_ranked)} candidates scored. "
-            f"Sending top {len(top_30)} to LLM."
+            f"[SCORING] {len(normal_ranked)} candidates scored with deterministic score."
         )
 
-        # =====================================================
-        # STEP 6 — LLM FINAL SCORING (Top 30 only)
-        # =====================================================
-        run.current_stage = "AI_EVALUATION"
+        final_ranked: list[tuple] = []
+
+        # ---- Batch DB writes using deterministic normal scores for all FTS candidates ----
+        for cid, normal_score in normal_ranked:
+            try:
+                candidate_score = normal_score
+
+                jc = db.scalar(
+                    select(JobCandidate).where(
+                        JobCandidate.job_id == job.id,
+                        JobCandidate.candidate_id == cid,
+                    )
+                )
+                if not jc:
+                    jc = JobCandidate(job_id=job.id, candidate_id=cid)
+                    db.add(jc)
+                    db.flush()
+
+                jc.eligibility_status = (
+                    "ELIGIBLE" if candidate_score["total_score"] >= 60 else "INELIGIBLE"
+                )
+                jc.recruitment_status = "SCREENED"
+                jc.overall_score = candidate_score["total_score"]
+                jc.classification = candidate_score["classification"]
+
+                result_record = db.scalar(
+                    select(ScreeningResult).where(
+                        ScreeningResult.job_candidate_id == jc.id
+                    )
+                )
+                if not result_record:
+                    result_record = ScreeningResult(
+                        job_candidate_id=jc.id,
+                        classification=candidate_score["classification"],
+                    )
+                    db.add(result_record)
+
+                for key in [
+                    "mandatory_skills_score",
+                    "experience_score",
+                    "domain_score",
+                    "preferred_skills_score",
+                    "education_score",
+                    "location_score",
+                    "availability_score",
+                    "other_requirements_score",
+                    "total_score",
+                    "classification",
+                ]:
+                    setattr(result_record, key, candidate_score[key])
+
+                result_record.matching_details = {
+                    "normal_score": normal_score,
+                    "evaluation": None,
+                }
+                result_record.semantic_matches = []
+                result_record.missing_requirements = []
+                result_record.strengths = []
+                result_record.concerns = []
+                result_record.screening_model = "deterministic"
+                result_record.screening_version = "v3"
+
+                final_ranked.append((jc, candidate_score))
+                run.successful_candidates += 1
+
+            except Exception as error:
+                print(f"DB write failed for {cid}: {error}")
+                run.failed_candidates += 1
+
+            run.processed_candidates += 1
+
         db.commit()
 
-        import concurrent.futures
-
-        scoring_tasks: list[tuple[UUID, dict, dict]] = []
-
-        for cid, normal_score in top_30:
-            candidate = candidate_map.get(cid)
-            if not candidate:
-                continue
-            payload = {
-                "candidate": {
-                    "name": candidate.name,
-                    "experience": candidate.total_experience_years,
-                    "company": candidate.current_company,
-                    "role": candidate.current_role,
-                    "location": candidate.location,
-                    "notice_period_days": candidate.notice_period_days,
-                    "profile": candidate.profile_summary,
-                },
-                "requirements": {
-                    "min_experience": req.minimum_experience,
-                    "max_experience": req.maximum_experience,
-                    "mandatory_skills": req.mandatory_skills,
-                    "preferred_skills": req.preferred_skills,
-                    "education": req.education,
-                    "certifications": req.certifications,
-                    "domains": req.domains,
-                    "responsibilities": req.responsibilities,
-                    "location": req.location,
-                    "work_mode": req.work_mode,
-                    "notice_period_days": req.notice_period_days,
-                    "other_requirements": req.other_requirements,
-                },
-                "normal_score": normal_score,
-            }
-            scoring_tasks.append((cid, payload, normal_score))
-
-        final_ranked: list[tuple, dict] = []
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_data = {
-                executor.submit(ai_score_candidate, payload): (cid, normal_score)
-                for cid, payload, normal_score in scoring_tasks
-            }
-
-            for future in concurrent.futures.as_completed(future_to_data):
-                cid, normal_score = future_to_data[future]
-                try:
-                    llm_evaluation = future.result()
-                    llm_score = calculate_score(llm_evaluation)
-
-                    # Persist final score
-                    jc = db.scalar(
-                        select(JobCandidate).where(
-                            JobCandidate.job_id == job.id,
-                            JobCandidate.candidate_id == cid,
-                        )
-                    )
-                    if not jc:
-                        jc = JobCandidate(job_id=job.id, candidate_id=cid)
-                        db.add(jc)
-                        db.flush()
-
-                    jc.eligibility_status = (
-                        "ELIGIBLE" if llm_score["total_score"] >= 60 else "INELIGIBLE"
-                    )
-                    jc.recruitment_status = "SCREENED"
-                    jc.overall_score = llm_score["total_score"]
-                    jc.classification = llm_score["classification"]
-
-                    result_record = db.scalar(
-                        select(ScreeningResult).where(
-                            ScreeningResult.job_candidate_id == jc.id
-                        )
-                    )
-                    if not result_record:
-                        result_record = ScreeningResult(
-                            job_candidate_id=jc.id,
-                            classification=llm_score["classification"],
-                        )
-                        db.add(result_record)
-
-                    for key in [
-                        "mandatory_skills_score",
-                        "experience_score",
-                        "domain_score",
-                        "preferred_skills_score",
-                        "education_score",
-                        "location_score",
-                        "availability_score",
-                        "other_requirements_score",
-                        "total_score",
-                        "classification",
-                    ]:
-                        setattr(result_record, key, llm_score[key])
-
-                    result_record.matching_details = {
-                        "normal_score": normal_score,
-                        "evaluation": llm_evaluation.get("reasoning"),
-                    }
-                    result_record.semantic_matches = []
-                    result_record.missing_requirements = []
-                    result_record.strengths = []
-                    result_record.concerns = []
-                    result_record.screening_model = settings.EVALUATION_MODEL
-                    result_record.screening_version = "v3"
-
-                    final_ranked.append((jc, llm_score))
-                    run.successful_candidates += 1
-
-                except Exception as error:
-                    print(f"LLM scoring failed for {cid}: {error}")
-                    run.failed_candidates += 1
-
-                run.processed_candidates += 1
-                db.commit()
-
         # =====================================================
-        # STEP 7 — FINAL SORT & RANKING
+        # STEP 6 — FINAL SORT & RANKING
         # =====================================================
         final_ranked.sort(key=lambda item: item[1]["total_score"], reverse=True)
 
         for position, (jc, score) in enumerate(final_ranked, 1):
             jc.ranking_position = position
-            jc.is_shortlisted = position <= settings.TOP_N
+            jc.is_shortlisted = True
             db.add(jc)
 
         job.status = "ACTIVE"
@@ -2223,12 +2186,15 @@ def screen_job(db: Session, job_id: UUID) -> dict:
         run.completed_at = time_now()
         db.commit()
 
+        all_screened = get_job_candidates(db, job.id, limit=None)
+
         return {
             "job_id": str(job.id),
             "candidates_evaluated": len(candidate_ids),
             "normal_scored": len(normal_ranked),
-            "llm_scored": len(final_ranked),
-            "top_10": get_job_candidates(db, job.id, limit=settings.TOP_N),
+            "llm_scored": 0,
+            "top_10": all_screened,
+            "candidates": all_screened,
         }
 
     except Exception as exc:
@@ -2248,7 +2214,7 @@ def time_now():
 # ------------------------------------------------------------
 # QUERY FUNCTIONS
 # ------------------------------------------------------------
-def get_job_candidates(db: Session, job_id: UUID, limit: int = 10) -> list[dict]:
+def get_job_candidates(db: Session, job_id: UUID, limit: int | None = None) -> list[dict]:
     """
     Input: job UUID.
     Output: ranked candidates with complete score breakdown
@@ -2267,13 +2233,14 @@ def get_job_candidates(db: Session, job_id: UUID, limit: int = 10) -> list[dict]
         )
         .where(
             JobCandidate.job_id == job_id,
-            JobCandidate.is_shortlisted == True
         )
         .order_by(JobCandidate.ranking_position)
     ).all()
 
+    target_rows = rows[:limit] if limit is not None else rows
+
     # Bulk fetch resumes to avoid N+1 query problem
-    candidate_ids = [candidate.id for jc, candidate, screening in rows[:limit]]
+    candidate_ids = [candidate.id for jc, candidate, screening in target_rows]
     resumes = {}
     if candidate_ids:
         all_resumes = db.execute(
@@ -2285,7 +2252,7 @@ def get_job_candidates(db: Session, job_id: UUID, limit: int = 10) -> list[dict]
 
     results = []
 
-    for jc, candidate, screening in rows[:limit]:
+    for jc, candidate, screening in target_rows:
 
         # Convert weighted scores into frontend percentages.
         # Example: 24/30 = 80%.
@@ -2398,11 +2365,11 @@ def get_user_jobs(db: Session, user_id: UUID) -> list[dict]:
     return [{"job_id": str(j.id), "id": str(j.id), "title": j.title, "description": j.description or j.jd_raw_text, "location": j.location, "work_mode": j.work_mode, "file_name": j.jd_file_name, "status": j.status,
              "created_at": j.created_at.isoformat() if j.created_at else None} for j in jobs]
 
-def get_user_job_candidates(db: Session, user_id: UUID, job_id: UUID) -> list[dict]:
-    """Input: authenticated user and job UUID. Output: Top 10 only when the user owns the JD."""
+def get_user_job_candidates(db: Session, user_id: UUID, job_id: UUID, limit: int | None = None) -> list[dict]:
+    """Input: authenticated user and job UUID. Output: candidates when the user owns the JD."""
     if not db.scalar(select(Job.id).where(Job.id == job_id, Job.created_by == user_id)):
         raise PermissionError("Job does not belong to current user")
-    return get_job_candidates(db, job_id)
+    return get_job_candidates(db, job_id, limit=limit)
 
 def get_admin_jobs(db: Session) -> list[dict]:
     """Input: DB session. Output: all JDs with uploader and Top 10 summary."""

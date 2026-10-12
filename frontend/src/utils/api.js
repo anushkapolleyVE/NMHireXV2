@@ -18,8 +18,8 @@ const getHeaders = () => {
 
   return token
     ? {
-        "Authorization": `Bearer ${token}`,
-      }
+      "Authorization": `Bearer ${token}`,
+    }
     : {};
 };
 
