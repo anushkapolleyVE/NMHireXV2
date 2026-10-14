@@ -10,8 +10,8 @@ from alembic import context
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
-from app.models import Base
-from app.config import settings
+from app.models.schema import Base
+from app.core.config import settings
 
 
 config = context.config

@@ -2,43 +2,76 @@
 
 NMHireXV2 is an AI-powered recruitment platform designed for job description management, candidate screening, resume matching, ranking, and interview scheduling.
 
-### Current Updates
+### Current Updates (v1.2)
 
-- Added a new `frontend-static/` folder containing plain HTML, CSS, and JavaScript.
-- Removed the need for npm, React, and Vite to run the new frontend.
-- Updated `backend/app/main.py` to serve the static frontend directly through FastAPI.
-- Retained the existing frontend for reference.
+- Completely refactored the backend directory structure for better modularity and maintainability.
+- Separated core API routing, database schemas, and AI business logic into a dedicated `app/` package.
+- Cleaned up the backend root by migrating utility, testing, and database scripts into `scripts/` and `tests/` folders.
+- Added a `test.py` diagnostic script to automatically verify the integrity of the new architecture.
+- Retained the `frontend-static/` folder to serve plain HTML, CSS, and JavaScript directly through FastAPI without npm.
 - Kept the existing backend APIs and application logic unchanged.
-- Initial functionality review and testing are in progress.
 
 ### Project Structure
 
 ```text
-NMHireXV2/
-├── frontend/             # Existing React frontend
-├── frontend-static/      # New HTML/CSS/JS frontend
-│   ├── index.html
-│   ├── css/
-│   ├── js/
-│   └── assets/
-├── backend/
-│   ├── app/
-│   │   └── main.py       # Updated to serve static frontend
-│   └── requirements.txt
-└── README.md
+backend/
+│
+├── app/                        # All core application code
+│   ├── main.py                 # FastAPI entry point and CORS setup
+│   ├── core/                   # Setup and configurations
+│   │   ├── config.py
+│   │   ├── database.py
+│   │   └── auth.py
+│   ├── api/                    # API endpoints
+│   │   └── routes.py           # Previously api.py
+│   ├── models/                 # Database schemas
+│   │   └── schema.py           # Previously models.py
+│   └── services/               # AI and business logic
+│       ├── tool_functions.py   # Main pipeline and scoring logic
+│       ├── skill_tree.py       # Skill normalization rules
+│       └── tools.py            # LangGraph tools (if retained)
+│
+├── scripts/                    # Utility and database scripts
+│   ├── db/
+│   │   ├── create_table.py
+│   │   ├── alter_db.py
+│   │   ├── apply_gin_indexes.py
+│   │   └── run_fts_migration.py
+│   └── admin/
+│       ├── seed_admin.py
+│       ├── run_ingestion.py
+│       ├── check_candidate.py
+│       └── query.py
+│
+├── tests/                      # Dedicated testing folder
+│   ├── test_extraction.py
+│   └── test_pipeline.py
+│
+├── alembic/                    # Database migrations
+├── alembic.ini                 # Alembic configuration
+├── cand.json                   # Dummy candidate data
+├── requirements.txt
+├── test.py                     # Architecture diagnostics
+└── .env                        # Environment variables
 ```
 
 ### Running the Application
 
-From the `backend/` directory, with the Python environment activated:
+From the `backend/` directory, with your Python environment activated, run the architecture diagnostics:
 
 ```cmd
-python -m uvicorn app.main:app --reload
+python test.py
 ```
 
-Open: `http://127.0.0.1:8000/ui/`
+Then start the FastAPI server:
 
-No npm installation or separate frontend server is required.
+```cmd
+uvicorn app.main:app --reload
+```
+
+Open: http://127.0.0.1:8000/ui/
+
+No npm installation or separate frontend server is required. The static frontend is served directly through FastAPI from `frontend-static/`.
 
 ### Dummy Testing — LLM Engineer JD
 
@@ -52,6 +85,7 @@ No npm installation or separate frontend server is required.
 We are looking for an LLM Engineer to design, develop, and deploy production-ready Generative AI applications using Python, FastAPI, LangChain, LangGraph, and Large Language Models.
 
 **Key Responsibilities:**
+
 - Develop LLM-powered applications using OpenAI, Claude, and Llama.
 - Build Retrieval-Augmented Generation (RAG) pipelines.
 - Implement semantic search, embeddings, and reranking.
@@ -70,6 +104,7 @@ Python, FastAPI, LangChain, LangGraph, LlamaIndex, RAG, Prompt Engineering, Open
 MCP, LoRA, QLoRA, AWS, Azure, Kubernetes, LangSmith, RAGAS, MLflow, Multi-Agent Systems.
 
 **Qualifications:**
+
 - 3–5 years of software engineering or ML experience.
 - Hands-on experience with LLM applications.
 - Strong understanding of RAG architecture and vector search.
@@ -79,4 +114,4 @@ MCP, LoRA, QLoRA, AWS, Azure, Kubernetes, LangSmith, RAGAS, MLflow, Multi-Agent 
 
 ### Status
 
-Initial static frontend integration completed. Functional testing and further improvements are ongoing.
+Backend structural refactoring completed. Functional testing, UI refinements, and AI skill-matching enhancements are ongoing.
