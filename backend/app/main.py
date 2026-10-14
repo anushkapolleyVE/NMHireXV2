@@ -56,3 +56,12 @@ def health():
 # Development convenience.
 # For production use Alembic migrations instead.
 # Base.metadata.create_all(bind=engine)
+
+# Optional dependency-free frontend (served on the same origin as /api).
+# No Node.js, npm, CORS changes, or extra Python packages needed.
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
+
+_ui_dir = Path(__file__).resolve().parents[2] / "frontend-static"
+if _ui_dir.is_dir():
+    app.mount("/ui", StaticFiles(directory=str(_ui_dir), html=True), name="static-ui")
