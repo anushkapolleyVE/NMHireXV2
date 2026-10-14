@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Match Agent</title>
+<style>
+:root{--bg:#020617;--card:#0f172a;--card2:#1e293b;--line:#334155;--tx:#fff;--mut:#94a3b8;--brand:#3b82f6;--acc:#14b8a6;--err:#fca5a5}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,sans-serif;padding-bottom:60px}
+.wrap{max-width:1280px;margin:0 auto;padding:28px 20px}
+h1{font-size:40px;margin:8px 0;letter-spacing:-.02em}h2{margin:4px 0;font-size:22px}
+.mut{color:var(--mut)}.tag{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mut)}
+.grid{display:grid;gap:24px;grid-template-columns:5fr 7fr}@media(max-width:1000px){.grid{grid-template-columns:1fr}}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:24px;padding:28px}
+.card{background:rgba(30,41,59,.5);border:1px solid var(--line);border-radius:16px;padding:18px;margin-bottom:14px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.between{justify-content:space-between}
+input,textarea{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:12px;padding:11px 14px;font:inherit}
+textarea{resize:none;margin-bottom:16px}label{display:block;font-weight:700;font-size:12px;margin-bottom:6px}
+button,.btn{cursor:pointer;border:1px solid var(--line);background:var(--card2);color:#cbd5e1;border-radius:12px;padding:9px 15px;font:700 12px system-ui;text-decoration:none;display:inline-block}
+button:hover:not(:disabled){color:#fff;background:#334155}button:disabled{opacity:.5;cursor:not-allowed}
+.big{width:100%;padding:14px;font-size:14px;color:#fff;margin-top:10px}
+.primary{background:#4f46e5;border:none}.green{background:#16a34a;color:#fff;border:none}.teal{background:#10b981;color:#fff;border:none}.brandb{background:var(--brand);color:#fff;border:none}
+.pill{font-size:11px;font-weight:700;padding:3px 10px;border-radius:99px;background:rgba(20,184,166,.2);color:var(--acc);border:1px solid rgba(20,184,166,.3)}
+.pill.b{background:rgba(59,130,246,.2);color:var(--brand);border-color:transparent}.pill.g{background:var(--card2);color:var(--mut);border-color:var(--line)}
+.drop{border:2px dashed var(--line);border-radius:16px;padding:28px;text-align:center;position:relative;cursor:pointer}
+.drop input{position:absolute;inset:0;opacity:0;cursor:pointer;height:100%}
+.or{text-align:center;margin:18px 0;color:#64748b;font-size:11px;font-weight:700;letter-spacing:.1em}
+.bar{height:8px;background:var(--card2);border-radius:9px;overflow:hidden;margin-top:10px}.bar i{display:block;height:100%;background:var(--brand);transition:width .3s}
+.err{border:1px solid rgba(239,68,68,.3);background:rgba(239,68,68,.1);color:var(--err);padding:12px 16px;border-radius:12px;font-weight:700;margin-bottom:20px}
+.score{font-size:36px;font-weight:800;color:var(--acc);line-height:1}
+.bd{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;margin-top:14px;background:rgba(2,6,23,.6);padding:14px;border-radius:12px}
+.bd div{background:var(--card2);padding:10px;border-radius:8px}.bd small{color:var(--mut);font-weight:700;font-size:10px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;padding:16px;z-index:50}
+.mbox{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:26px;width:100%;max-width:860px;max-height:90vh;overflow:auto}
+.mbox.sm{max-width:440px;background:#fff;color:#1e293b}.mbox.sm .mut{color:#64748b}.mbox.sm button:not(.green){background:#fff;color:#334155;border-color:#e2e8f0}
+.kv{display:flex;gap:14px;background:rgba(30,41,59,.5);border:1px solid var(--line);padding:13px;border-radius:12px;margin-bottom:10px}.kv b{width:130px;flex-shrink:0;color:var(--mut)}
+.chips span{display:inline-block;margin:0 6px 6px 0;padding:3px 10px;border-radius:8px;background:rgba(59,130,246,.2);color:var(--brand);font-weight:700}
+.cmp{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px;padding:12px 0;border-bottom:1px solid rgba(51,65,85,.5)}.win{color:var(--acc);font-weight:800}
+.warn{background:#fffbf0;border:1px solid #fde68a;color:#92400e;padding:14px;border-radius:14px;margin:12px 0}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+<div id="modal"></div>
+
+<script>
+/* =====================================================================
+   CONFIG — adjust to match your ../utils/api implementation
+   ===================================================================== */
+const CONFIG = { API_BASE: location.protocol === "file:" ? "http://localhost:8000" : "", DEV_STAGE: "production", STAGE_NUMBER: "" }; // same origin as FastAPI
+const getToken = () => localStorage.getItem("token");
+function logout() { localStorage.removeItem("token"); location.reload(); }
+
+const API = {
+  async _req(path, opts = {}) {
+    const headers = { ...(opts.headers || {}) };
+    const token = getToken();
+    if (token) headers["Authorization"] = "Bearer " + token;
+    
+    const res = await fetch(CONFIG.API_BASE + path, { ...opts, headers });
+    if (res.status === 401) {
+        logout();
+        throw new Error("Unauthorized. Please log in.");
+    }
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { const j = await res.json(); msg = j.detail || j.message || msg; } catch {}
+      throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    }
+    return res.json();
+  },
+  async login(email, password) {
+    const r = await this._req("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: email, password }) });
+    localStorage.setItem("token", r.access_token); return r;
+  },
+  createJob(file) { const f = new FormData(); f.append("file", file); return this._req("/api/jobs", { method: "POST", body: f }); },
+  createJobFromText(text) { const f = new FormData(); f.append("jd_text", text); return this._req("/api/jobs", { method: "POST", body: f }); },
+  screenJob(id) { return this._req(`/api/jobs/${id}/screen`, { method: "POST" }); },
+  getJobCandidates(id) { return this._req(`/api/user/jobs/${id}/candidates`); },
+  updateCandidateStatus(jobId, cid, status, phone) {
+    return this._req(`/api/user/jobs/${jobId}/candidates/${cid}/status`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status, target_phone: phone }) });
+  }
+};
+
+/* =====================================================================
+   HELPERS
+   ===================================================================== */
+const WEIGHTS = { mandatory_skills: 30, experience: 25, domain: 15, preferred_skills: 10, education: 5, location: 5, availability: 5, other_requirements: 5 };
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const label = k => String(k).replaceAll("_", " ").replace(/\b\w/g, l => l.toUpperCase());
+const mmss = s => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+const cid = (c, i) => c.candidate_id || c.id || i;
+const skillName = s => s == null ? "" : typeof s === "object" ? (s.skill_name || s.normalized_skill_name || s.name || s.skill || "") : String(s);
+const list = v => Array.isArray(v) ? v.map(skillName).filter(Boolean) : [];
+
+function resumeUrl(url) {
+  if (!url) return null;
+  let m = url.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/); if (m) return `https://drive.google.com/file/d/${m[1]}/view`;
+  m = url.match(/[?&]id=([a-zA-Z0-9_-]{25,})/); if (m) return `https://drive.google.com/file/d/${m[1]}/view`;
+  m = url.match(/\/open\?id=([a-zA-Z0-9_-]{25,})/); if (m) return `https://drive.google.com/file/d/${m[1]}/view`;
+  return url;
+}
+const fmtExp = r => {
+  const a = r?.minimum_experience, b = r?.maximum_experience, ok = v => v !== null && v !== undefined;
+  if (ok(a) && ok(b)) return `${a}–${b} years`; if (ok(a)) return `${a}+ years`; if (ok(b)) return `Up to ${b} years`; return "Not specified";
+};
+const fmtNotice = r => {
+  const v = r?.notice_period_days; if (v === null || v === undefined || v === "") return "Not specified";
+  const n = Number(v); return Number.isNaN(n) ? String(v) : n === 0 ? "Immediate" : `${n} days`;
+};
+
+/* =====================================================================
+   STATE
+   ===================================================================== */
+const S = {
+  file: null, jobTitle: "", jdText: "", job: null, requirements: null, jobId: null,
+  status: "Draft", analyzing: false, jdProgress: 0, searching: false, progress: 0, elapsed: 0, took: null,
+  searchComplete: false, error: "", candidates: [], contacted: {}, waContacted: {}, showList: false, queueReady: false
+};
+let timers = {};
+
+/* =====================================================================
+   ACTIONS
+   ===================================================================== */
+async function analyze() {
+  S.error = ""; S.searchComplete = false; S.candidates = []; S.requirements = null;
+  if (!S.file && !S.jdText.trim()) { S.error = "Please upload a job description or paste the JD text."; return render(); }
+  S.analyzing = true; S.jdProgress = 0; S.status = "Analyzing"; render();
+  const iv = setInterval(() => { if (S.jdProgress < 88) { S.jdProgress = Math.min(S.jdProgress + (S.jdProgress < 40 ? 6 : S.jdProgress < 70 ? 3 : 1), 88); render(); } }, 400);
+  try {
+    const r = S.file ? await API.createJob(S.file) : await API.createJobFromText(S.jdText.trim());
+    clearInterval(iv); S.jdProgress = 100; render(); await new Promise(r => setTimeout(r, 600));
+    S.job = r; S.jobId = r.job_id; S.requirements = r.requirements || {};
+    S.jobTitle = r.requirements?.job_title || r.title || S.jobTitle || "Job Description"; S.status = "Criteria ready";
+  } catch (e) { clearInterval(iv); S.status = "Draft"; S.error = e.message || "Failed to analyze the job description."; }
+  S.analyzing = false; S.jdProgress = 0; render();
+}
+
+function startClock() { S.elapsed = 0; clearInterval(timers.clock); timers.clock = setInterval(() => { S.elapsed++; const el = document.getElementById("clock"); if (el) el.textContent = mmss(S.elapsed); }, 1000); }
+function stopClock() { clearInterval(timers.clock); }
+
+async function screen(id = null) {
+  S.error = ""; const jid = id || S.jobId;
+  if (!jid) { S.error = "Please analyze the job description first."; return render(); }
+  S.searching = true; S.progress = 0; S.searchComplete = false; S.status = "Screening"; startClock(); render();
+  const iv = setInterval(() => { if (S.progress < 95) { S.progress += S.progress < 50 ? 5 : S.progress < 80 ? 2 : 1; render(); } }, 500);
+  try {
+    const r = await API.screenJob(jid);
+    clearInterval(iv); S.progress = 100; S.took = S.elapsed; render(); await new Promise(r => setTimeout(r, 400));
+    S.candidates = Array.isArray(r?.top_10) ? r.top_10 : []; S.searchComplete = true; S.status = "Screening";
+  } catch (e) { clearInterval(iv); S.error = e.message || "Failed to screen candidates."; S.status = "Criteria ready"; }
+  stopClock(); S.searching = false; render();
+}
+
+async function loadExisting(id) {
+  S.error = ""; S.jobId = id; S.searching = true; S.progress = 0; S.searchComplete = false; S.status = "Loading candidates"; S.showList = true; render();
+  const iv = setInterval(() => { S.progress = Math.min(95, S.progress + 15); render(); }, 200);
+  try {
+    const c = await API.getJobCandidates(id);
+    clearInterval(iv); S.progress = 100; render(); await new Promise(r => setTimeout(r, 300));
+    S.candidates = c || []; S.searchComplete = true; S.status = "Screening";
+  } catch (e) { clearInterval(iv); S.error = e.message || "Failed to fetch candidates."; S.status = "Criteria ready"; }
+  S.searching = false; render();
+}
+
+async function contact(key, phone = null) {
+  S.contacted[key] = true; render();
+  try { if (S.jobId) await API.updateCandidateStatus(S.jobId, key, "CONTACTED", phone); } catch (e) { console.error("Failed to mark contacted", e); }
+}
+
+function resetSearch() {
+  Object.assign(S, { jobId: null, jobTitle: "", jdText: "", file: null, requirements: null, candidates: [], searchComplete: false, status: "Draft" });
+  render();
+}
+
+/* =====================================================================
+   MODALS
+   ===================================================================== */
+const closeModal = () => document.getElementById("modal").innerHTML = "";
+const setModal = html => document.getElementById("modal").innerHTML = html;
+
+function openJD() {
+  const r = S.requirements; if (!r) return;
+  const chips = (arr) => arr.length ? `<div class="chips">${arr.map(s => `<span>${esc(s)}</span>`).join("")}</div>` : `<span class="mut">None specified</span>`;
+  const edu = list(r.education), cert = list(r.certifications);
+  setModal(`<div class="modal" onclick="if(event.target===this)closeModal()"><div class="mbox">
+    <div class="row between"><div><h2>AI-generated search criteria</h2><p class="mut">Extracted from the job description for accurate candidate matching.</p></div><button onclick="closeModal()">Close</button></div><br>
+    <div class="kv"><b>Experience:</b><span>${esc(fmtExp(r))}</span></div>
+    <div class="kv"><b>Location:</b><span>${esc(r.location || S.job?.location || "Not specified")}</span></div>
+    <div class="kv"><b>Work mode:</b><span>${esc(r.work_mode || "Not specified")}</span></div>
+    <div class="kv"><b>Notice Period:</b><span>${esc(fmtNotice(r))}</span></div>
+    <div class="kv"><b>Mandatory Skills:</b>${chips(list(r.mandatory_skills))}</div>
+    <div class="kv"><b>Preferred Skills:</b>${chips(list(r.preferred_skills))}</div>
+    ${edu.length ? `<div class="kv"><b>Education:</b><span>${esc(edu.join(", "))}</span></div>` : ""}
+    ${cert.length ? `<div class="kv"><b>Certifications:</b><span>${esc(cert.join(", "))}</span></div>` : ""}
+  </div></div>`);
+}
+
+function openProfile(i) {
+  const c = S.candidates[i]; if (!c) return;
+  const rows = Object.entries(c).filter(([k, v]) => v !== null && v !== "" && typeof v !== "object" && !["score_breakdown"].includes(k))
+    .map(([k, v]) => `<div class="kv"><b>${esc(label(k))}</b><span>${esc(v)}</span></div>`).join("");
+  const skills = list(c.skills);
+  setModal(`<div class="modal" onclick="if(event.target===this)closeModal()"><div class="mbox">
+    <div class="row between"><h2>${esc(c.name || "Unnamed Candidate")}</h2><button onclick="closeModal()">Close</button></div><br>
+    ${c.reasoning ? `<div class="card"><p class="tag">AI Assessment Reasoning</p><p class="mut">${esc(c.reasoning)}</p></div>` : ""}
+    ${skills.length ? `<div class="chips">${skills.map(s => `<span>${esc(s)}</span>`).join("")}</div>` : ""}
+    ${rows}</div></div>`);
+}
+
+let cmp = { base: null, other: "", q: "" };
+function openCompare(i) { cmp = { base: i, other: "", q: "" }; renderCompare(); }
+function renderCompare() {
+  const base = S.candidates[cmp.base], other = cmp.other !== "" ? S.candidates[cmp.other] : null;
+  const norm = (c, k) => { const v = c?.score_breakdown?.[k]; return v && typeof v === "object" ? (v.percentage || 0) : 0; };
+  const summary = c => `<div class="card"><h3 style="margin:0 0 4px">${esc(c.name || "Unnamed")}</h3>
+    <p class="mut" style="font-size:12px">${esc(c.current_role || c.job || "Role unknown")}${c.current_company ? " @ " + esc(c.current_company) : ""} • ${esc(c.location || "Location unknown")} • ${esc(c.experience_years != null ? c.experience_years + " yrs" : "0 yrs")}</p>
+    <span class="score">${Number(c.score || 0).toFixed(0)}</span> <span class="pill">${esc(label(c.classification || "Good Match"))}</span></div>`;
+  const picker = `<div class="card"><input id="cq" placeholder="Search candidate name..." value="${esc(cmp.q)}" oninput="cmp.q=this.value;renderCompare();document.getElementById('cq').focus()">
+    <div style="max-height:140px;overflow:auto;margin-top:8px">${S.candidates.map((c, j) => j === cmp.base || (cmp.q && !(c.name || "").toLowerCase().includes(cmp.q.toLowerCase())) ? "" :
+      `<button style="width:100%;text-align:left;border:none;background:none;display:flex;justify-content:space-between" onclick="cmp.other=${j};renderCompare()"><span>${esc(c.name || "Unnamed")}</span><span class="mut">${Number(c.score || 0).toFixed(0)}</span></button>`).join("")}</div></div>`;
+  const rows = other ? Object.keys(WEIGHTS).map(k => { const a = norm(base, k), b = norm(other, k);
+    return `<div class="cmp"><span>${label(k)} <small class="mut">${WEIGHTS[k]}%</small></span><b class="${a > b ? "win" : ""}" style="text-align:right">${a}${a > b ? " ▲" : ""}</b><b class="${b > a ? "win" : ""}" style="text-align:right">${b}${b > a ? " ▲" : ""}</b></div>`; }).join("") : "";
+  const reason = c => `<div class="card"><b>${esc(c.name)}</b><p class="tag" style="color:var(--brand)">AI Assessment Reasoning</p><p class="mut" style="font-size:12px">${esc(c.reasoning || "No specific reasoning provided by the AI.")}</p></div>`;
+  setModal(`<div class="modal" onclick="if(event.target===this)closeModal()"><div class="mbox">
+    <div class="row between"><div><h2>Compare candidates</h2><p class="mut">Both candidates were scored against the same job description.</p></div><button onclick="closeModal()">Close</button></div><br>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px"><div><p class="tag">Comparing</p>${summary(base)}</div>
+    <div><p class="tag">Against</p>${other ? summary(other) + `<button onclick="cmp.other='';renderCompare()">Pick someone else</button>` : picker}</div></div>
+    ${other ? `<div style="margin:10px 0">${rows}</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">${reason(base)}${reason(other)}</div>` : ""}
+  </div></div>`);
+}
+
+function openWhatsapp(i) {
+  const c = S.candidates[i]; if (!c) return;
+  const stage = CONFIG.DEV_STAGE !== "production";
+  const sub = [c.current_role || c.job, c.current_company ? "@ " + c.current_company : "", c.location ? "- " + c.location : ""].filter(Boolean).join(" ");
+  setModal(`<div class="modal"><div class="mbox sm">
+    <h2>Send WhatsApp invite</h2><p class="mut">Confirm the number before it goes out.</p>
+    <div class="card" style="background:#f3f5f9;border:none"><h3 style="margin:0">${esc(c.name || "Unnamed Candidate")}</h3>${sub ? `<p class="mut">${esc(sub)}</p>` : ""}<p class="mut">Candidate's number: ${esc(c.phone || "No phone number")}</p></div>
+    ${stage ? `<div class="warn"><b style="font-size:11px;letter-spacing:.1em">STAGE MODE — ACTUALLY SENDING TO</b><div style="font-size:20px;font-weight:800">${esc(CONFIG.STAGE_NUMBER)}</div><p>${esc(c.name || "Candidate")} receives nothing. Set <code>HIRE_X_DEV_STAGE=production</code> to contact candidates for real.</p></div>` : ""}
+    <div class="row" style="justify-content:flex-end;margin-top:20px"><button onclick="closeModal()">Cancel</button>
+    <button class="green" ${c.phone ? "" : "disabled"} onclick="sendWhatsapp(${i})">Send invite</button></div></div></div>`);
+}
+async function sendWhatsapp(i) {
+  const c = S.candidates[i], key = cid(c, i), stage = CONFIG.DEV_STAGE !== "production";
+  S.waContacted[key] = true; closeModal(); render();
+  contact(key, stage ? CONFIG.STAGE_NUMBER : c.phone);
+}
+
+/* =====================================================================
+   RENDER
+   ===================================================================== */
+function candidateCards() {
+  return S.candidates.map((c, i) => {
+    const key = cid(c, i), bd = c.score_breakdown && typeof c.score_breakdown === "object" ? c.score_breakdown : {};
+    const hasR = c.resume_url && c.resume_url.startsWith("http");
+    return `<div class="card">
+      <div class="row between"><div><div class="row"><b style="font-size:16px">${esc(c.name || "Unnamed Candidate")}</b><span class="pill">${esc(label(c.classification || "Match"))}</span>${c.recommendation ? `<span class="pill ${c.recommendation === "review" ? "g" : ""}">${esc(label(c.recommendation))}${c.scored_by === "llm" ? " · AI scored" : ""}</span>` : ""}</div>
+        <div class="mut" style="font-size:12px;margin-top:6px">${esc(c.email || "Email unavailable")}</div></div>
+        <div style="text-align:right"><div class="score">${Number(c.score || 0).toFixed(1)}</div><div class="tag">Match / 100</div></div></div>
+      <div class="row" style="margin-top:14px"><span class="pill b">Rank #${esc(c.rank || i + 1)}</span>${c.status ? `<span class="pill g">${esc(c.status)}</span>` : ""}</div>
+      ${Object.keys(bd).length ? `<div class="bd" style="display:block"><p class="tag" style="color:#cbd5e1">Score breakdown</p><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;background:none;padding:0">${Object.entries(bd).map(([k, v]) => {
+        const it = v && typeof v === "object" ? v : { score: v };
+        return `<div><small>${esc(label(k))}</small><div><b>${esc(it.score ?? 0)}${it.max_score != null ? " / " + esc(it.max_score) : ""}</b></div>${it.percentage != null ? `<small style="color:var(--acc)">${esc(it.percentage)}%</small>` : ""}</div>`; }).join("")}</div></div>` : ""}
+      <div class="row" style="justify-content:flex-end;margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+        <button onclick="openProfile(${i})">View Profile</button>
+        <button ${hasR ? "" : "disabled"} onclick="window.open(resumeUrl(S.candidates[${i}].resume_url),'_blank')">${hasR ? "View Resume" : "Resume not available"}</button>
+        <button onclick="openCompare(${i})">Compare</button>
+        <button class="${S.contacted[key] ? "" : "brandb"}" ${S.contacted[key] ? "disabled" : ""} onclick="contact('${esc(key)}')">${S.contacted[key] ? "✓ Added to outreach" : "Add to outreach"}</button>
+        <button class="green" ${S.waContacted[key] ? "disabled" : ""} onclick="openWhatsapp(${i})">${S.waContacted[key] ? "✓ Sent invite" : "WhatsApp"}</button>
+      </div></div>`;
+  }).join("");
+}
+
+function render() {
+  const a = document.getElementById("app");
+  if (!getToken()) return renderLogin(a);
+  const focus = document.activeElement?.id, pos = document.activeElement?.selectionStart;
+
+  if (S.showList) {
+    a.innerHTML = `<button onclick="S.showList=false;render()" style="margin-bottom:20px">← Back to Job Intake</button>
+      <h2 style="font-size:30px;margin-bottom:24px">Screened Candidates</h2>
+      ${S.searching ? `<div style="text-align:center;padding:70px"><h3>Loading candidates... ${S.progress}%</h3><div class="bar" style="max-width:260px;margin:10px auto"><i style="width:${S.progress}%"></i></div></div>`
+        : !S.candidates.length ? `<div class="mut" style="text-align:center;padding:70px">No candidates found for this job.</div>` : candidateCards()}
+      ${S.searchComplete && S.candidates.length ? `<div class="card row between" style="background:linear-gradient(90deg,rgba(59,130,246,.2),rgba(168,85,247,.2));margin-top:24px"><div><p class="tag">Step 4 · Outreach</p><p>Review the eligible candidates before starting outreach.</p></div><button class="brandb" onclick="S.queueReady=true;render()">Review outreach queue</button></div>` : ""}
+      ${S.queueReady ? `<p class="pill" style="display:block;padding:12px">✓ Outreach queue is ready for review.</p>` : ""}`;
+    return;
+  }
+
+  const strong = S.searchComplete ? S.candidates.filter(c => Number(c.score || 0) >= 80).length : 0;
+  const pp = S.jdProgress;
+  a.innerHTML = `
+  <div class="row between" style="align-items:flex-end;margin-bottom:28px"><div><span class="pill g">03 · MATCH AGENT</span><h1>Turn a JD into a shortlist.</h1>
+    <p class="mut" style="max-width:700px">Upload a job description, let AI create search criteria, then rank candidates using the screening model.</p></div>
+    </div>
+  ${S.error ? `<div class="err">${esc(S.error)}</div>` : ""}
+  <div class="grid">
+   <section class="panel" style="height:fit-content">
+    <div class="row between" style="margin-bottom:20px"><div><p class="tag">Step 1 · Job intake</p><h2>Create a search</h2></div><span class="pill">${esc(S.status)}</span></div>
+    <label for="jt">Job title</label><input id="jt" value="${esc(S.jobTitle)}" placeholder="Job title" oninput="S.jobTitle=this.value" style="margin-bottom:18px">
+    <div class="drop"><input type="file" accept=".pdf,.doc,.docx,.txt" onchange="onFile(this)"><b>Upload Job Description</b><p class="mut" style="font-size:12px;margin:4px 0 0">PDF, DOC, DOCX or TXT · up to 10 MB</p>
+      ${S.file ? `<p><span class="pill b">✓ ${esc(S.file.name)} selected</span></p>` : ""}</div>
+    <div class="or">— OR PASTE JD —</div>
+    <textarea id="jd" rows="7" placeholder="Paste the job description here…" oninput="onJdText(this)">${esc(S.jdText)}</textarea>
+    <button class="big" ${S.analyzing ? "disabled" : ""} onclick="analyze()" style="background:${S.analyzing ? "#0f172a" : "#1e293b"}">${S.analyzing ? `Parsing JD… ${pp}%` : S.requirements ? "Re-analyze JD" : "Analyze JD & Create Search Criteria"}</button>
+    ${S.analyzing ? `<div class="mut" style="font-size:11px;margin-top:10px;display:flex;justify-content:space-between"><span>${pp < 30 ? "Reading document…" : pp < 60 ? "Extracting requirements…" : pp < 88 ? "Building search criteria…" : "Finalising…"}</span><b>${pp}%</b></div>
+      <div class="bar"><i style="width:${pp}%;background:linear-gradient(90deg,#14b8a6,#6366f1)"></i></div>${pp === 100 ? `<p style="text-align:center;color:var(--acc);font-weight:700;font-size:11px">✓ JD parsed successfully!</p>` : ""}` : ""}
+    ${S.requirements ? `<div class="card" style="margin-top:20px;background:rgba(23,37,84,.4);cursor:pointer" onclick="openJD()"><div class="row between"><div><b>JD Parsing Result</b><div class="mut" style="font-size:12px">Click to view the parsed JD details</div></div><span style="color:var(--brand);font-weight:700">Open</span></div></div>
+      <button class="big primary" ${S.searching || !S.jobId ? "disabled" : ""} onclick="screen()">${S.searching ? `Screening candidates… ${S.progress}%` : "Screen Candidates"}</button>
+      <button class="big teal" onclick="resetSearch()">Start a New Search</button>` : ""}
+   </section>
+
+   <section class="panel">
+    <div class="row between" style="margin-bottom:20px"><div><p class="tag">Steps 2–3 · Screening</p><h2>Ranked candidates</h2></div>
+      <div class="row"><span class="pill g">Screened: ${S.searchComplete ? S.candidates.length : 0}</span><span class="pill">✓ ${strong} strong</span></div></div>
+    ${!S.searchComplete && !S.searching ? `<div class="card" style="border-style:dashed;text-align:center;padding:50px"><b>No candidates yet</b><p class="mut">Analyze a job description and search for candidates to see the ranked shortlist.</p></div>` : ""}
+    ${S.searching ? `<div class="card" style="text-align:center;padding:40px"><div style="text-align:right"><span class="pill" style="font-family:monospace">⏱ <span id="clock">${mmss(S.elapsed)}</span></span></div>
+      <b style="font-size:16px">Screening candidates… ${S.progress}%</b><div class="bar" style="max-width:300px;margin:12px auto"><i style="width:${S.progress}%"></i></div>
+      <p class="mut">The AI screening engine is evaluating candidates against the job requirements.</p></div>` : ""}
+    ${S.searchComplete ? (!S.candidates.length ? `<div class="card" style="text-align:center"><b>No matching candidates found.</b><p class="mut">Try reviewing the extracted criteria or using a different job description.</p></div>`
+      : `<div class="card" style="text-align:center;padding:40px"><h3>Screening Complete</h3><p class="mut">Successfully screened and ranked ${S.candidates.length} candidates against your criteria.</p>
+        ${S.took !== null ? `<p><span class="pill g">Completed in <b style="color:var(--acc);font-family:monospace">${mmss(S.took)}</b></span></p>` : ""}
+        <button class="brandb" onclick="S.showList=true;render()">View Screened Candidates →</button></div>`) : ""}
+   </section>
+  </div>`;
+  if (focus) { const el = document.getElementById(focus); if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch {} } }
+}
+
+function renderLogin(a) {
+  a.innerHTML = `<div class="panel" style="max-width:420px;margin:80px auto"><h2>Recruiter login</h2><p class="mut">Sign in to use the Match Agent.</p>
+    ${S.error ? `<div class="err">${esc(S.error)}</div>` : ""}
+    <label for="le">Email</label><input id="le" type="email" style="margin-bottom:14px">
+    <label for="lp">Password</label><input id="lp" type="password" style="margin-bottom:18px" onkeydown="if(event.key==='Enter')doLogin()">
+    <button class="big brandb" onclick="doLogin()">Log in</button></div>`;
+}
+async function doLogin() {
+  try { await API.login(document.getElementById("le").value.trim(), document.getElementById("lp").value); S.error = ""; }
+  catch (e) { S.error = e.message; }
+  render();
+}
+
+function onFile(inp) { const f = inp.files?.[0]; if (!f) return; S.file = f; S.jdText = ""; S.error = ""; render(); }
+function onJdText(t) { S.jdText = t.value; if (t.value.trim()) S.file = null; /* no re-render while typing */ }
+
+/* =====================================================================
+   INIT — supports ?jobId=123&screened=1 (replaces router state from dashboard)
+   ===================================================================== */
+render();
+const q = new URLSearchParams(location.search);
+if (q.get("jobId")) { S.jobId = q.get("jobId"); q.get("screened") === "1" ? loadExisting(S.jobId) : screen(S.jobId); }
+</script>
+</body>
+</html>

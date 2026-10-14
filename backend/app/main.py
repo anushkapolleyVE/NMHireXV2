@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse  # <-- ADDED THIS IMPORT
 
 from app.api.routes import router
 from app.core.database import engine
@@ -45,6 +46,20 @@ app.include_router(router)
 def health():
     """Simple service health response."""
     return {"status": "ok"}
+
+# ============================================================
+# TEST RERANKING ENDPOINT
+# ============================================================
+@app.get("/test-reranking")
+def test_reranking_ui():
+    """Serves the test match-agent.html file."""
+    # Path(__file__).resolve().parents[1] points to the backend/ folder
+    html_path = Path(__file__).resolve().parents[1] / "tests" / "match-agent.html"
+    
+    if html_path.exists():
+        return FileResponse(html_path)
+    return {"error": f"File not found at {html_path}"}
+
 
 # ============================================================
 # FRONTEND STATIC
