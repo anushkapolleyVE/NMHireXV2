@@ -29,6 +29,11 @@ from fastapi import (
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy import cast, String
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Request, Query
+
+import json
+from app.services.naukri_adapter import adapt_naukri_candidate
+from app.services.enhanced.match_score import score_candidates
 
 # --- UPDATED IMPORTS FOR NEW STRUCTURE ---
 from app.core.database import get_db
@@ -673,11 +678,103 @@ def api_screen_job(
             detail=str(exc),
         )
 
+# ============================================================
+# SCREEN BATCH (NAUKRI JSON)
+# ============================================================
+
+@router.post("/jobs/{job_id}/screen-batch")
+async def api_screen_batch(
+    job_id: UUID,
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Accepts a Naukri JSON file, adapts it, and scores it entirely through 
+    the Enhanced Engine without requiring DB insertion.
+    """
+    job = db.get(Job, job_id)
+    if not job or not job.requirements:
+        raise HTTPException(status_code=404, detail="Job or requirements not found")
+
+    if user.role != "ADMIN" and job.created_by != user.id:
+        raise HTTPException(status_code=403, detail="You do not have access to this job")
+
+    try:
+        contents = await file.read()
+        payload = json.loads(contents)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON file")
+
+    raw_candidates = payload.get("candidates", [])
+    if not raw_candidates:
+        return {"results": []}
+
+    # 1. Adapt Naukri JSON to Enhanced format
+    adapted_candidates = [adapt_naukri_candidate(c) for c in raw_candidates]
+
+    # 2. Format JD for Enhanced Engine
+    req = job.requirements
+    jd_dict = {
+        "job_title": req.job_title,
+        "minimum_experience": float(req.minimum_experience) if req.minimum_experience is not None else None,
+        "maximum_experience": float(req.maximum_experience) if req.maximum_experience is not None else None,
+        "mandatory_skills": req.mandatory_skills or [],
+        "preferred_skills": req.preferred_skills or [],
+        "education": req.education or [],
+        "certifications": req.certifications or [],
+        "domain": ", ".join(req.domains) if req.domains else "",
+        "location": req.location,
+        "work_mode": req.work_mode,
+        "jd_text_description": job.description or job.jd_raw_text or "",
+    }
+
+    # 3. Score directly via Enhanced Engine
+    scored_results = score_candidates(jd=jd_dict, candidates=adapted_candidates, debug=True)
+
+    # 4. Map back to UI format
+    ui_results = []
+    for rank, res in enumerate(scored_results, 1):
+        # Find the original adapted candidate data to return context to the UI
+        c_data = next((c for c in adapted_candidates if c["id"] == res["candidate_id"]), {})
+        
+        ui_results.append({
+            "rank": rank,
+            "candidate_id": res["candidate_id"],
+            "name": res["candidate_name"],
+            "email": c_data.get("email", ""),
+            "phone": c_data.get("phone", ""),
+            "resume_url": None, # No PDF for JSON batches
+            "experience_years": c_data.get("total_experience"),
+            "current_company": c_data.get("currentcompany"),
+            "current_role": c_data.get("designation"),
+            "location": c_data.get("location"),
+            "skills": c_data.get("skills", []),
+            "experience_details": c_data.get("experiences", []),
+            "status": "SCREENED",
+            
+            # For JSON benchmark mode, we only use the enhanced score
+            "score": res["final_score"],
+            "classification": res["recommendation_status"],
+            "score_breakdown": res["score_breakdown"],
+            
+            "enhanced_score": res["final_score"],
+            "enhanced_classification": res["recommendation_status"],
+            "enhanced_breakdown": res["score_breakdown"],
+            "reasoning": res["recommendation_reason"]
+        })
+
+    return {
+        "job_id": str(job.id),
+        "source": "json_batch",
+        "candidates_evaluated": len(adapted_candidates),
+        "candidates": ui_results
+    }
+
 
 # ============================================================
 # RECRUITER - DASHBOARD
 # ============================================================
-
 
 @router.get("/user/dashboard")
 def api_user_dashboard(
@@ -746,12 +843,13 @@ def api_user_jobs(
 @router.get("/user/jobs/{job_id}/candidates")
 def api_user_candidates(
     job_id: UUID,
+    limit: int | None = Query(None, description="Number of candidates to return"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     Return candidates matched to the authenticated recruiter's job.
-
+   
     Ownership is checked by user ID.
     """
 
@@ -768,19 +866,9 @@ def api_user_candidates(
         )
 
     try:
-
-        return get_user_job_candidates(
-            db,
-            user.id,
-            job_id,
-        )
-
+        return get_user_job_candidates(db, user.id, job_id, limit=limit)
     except PermissionError:
-
-        raise HTTPException(
-            status_code=403,
-            detail="You do not have access to this job",
-        )
+        raise HTTPException(status_code=403, detail="You do not have access to this job")
 
 
 # ============================================================
@@ -810,26 +898,17 @@ def api_admin_jobs(
 @router.get("/admin/jobs/{job_id}/candidates")
 def api_admin_candidates(
     job_id: UUID,
+    limit: int | None = Query(None, description="Number of candidates to return"),
     admin: User = Depends(auth_require_admin),
     db: Session = Depends(get_db),
 ):
     """
     Return candidates matched to an admin-selected job.
     """
-
     try:
-
-        return get_admin_job_candidates(
-            db,
-            job_id,
-        )
-
+        return get_admin_job_candidates(db, job_id, limit=limit)
     except ValueError:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found",
-        )
+        raise HTTPException(status_code=404, detail="Job not found")
 
 @router.post("/user/jobs/{job_id}/candidates/{candidate_id}/contact")
 def api_mark_contacted(

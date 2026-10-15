@@ -9,6 +9,7 @@ python-multipart
 python-dotenv
 groq
 openai
+rapidfuzz
 
 # Retry/backoff for transient rate-limit / connection errors.
 tenacity

@@ -21,6 +21,7 @@ import pymupdf
 from PIL import Image
 from datetime import datetime
 
+from app.services.enhanced.pipeline import run_enhanced_scoring
 from app.core.config import settings
 from app.models.schema import (
     User,
@@ -2083,15 +2084,16 @@ def screen_job(db: Session, job_id: UUID) -> dict:
             projects_map.setdefault(p.candidate_id, []).append(p)
 
         # =====================================================
-        # STEP 4 — NORMAL / DETERMINISTIC SCORING
+        # STEP 4 — NORMAL & ENHANCED SCORING
         # =====================================================
-        normal_ranked: list[tuple[UUID, dict]] = []
+        normal_ranked: list[tuple[UUID, dict, dict]] = []
 
         for cid in candidate_ids:
             candidate = candidate_map.get(cid)
             if not candidate:
                 continue
             try:
+                # 1. Run Classic Deterministic Scoring
                 score = calculate_normal_score(
                     candidate=candidate,
                     req=req,
@@ -2100,23 +2102,27 @@ def screen_job(db: Session, job_id: UUID) -> dict:
                     educations_map=educations_map,
                     projects_map=projects_map,
                 )
-                normal_ranked.append((cid, score))
+                
+                # 2. Run Enhanced Legacy Scoring (Fuzzy + AI Adjudicator)
+                enhanced_result = run_enhanced_scoring(candidate, req, job)
+                
+                normal_ranked.append((cid, score, enhanced_result))
             except Exception as error:
-                print(f"Normal scoring failed for {cid}: {error}")
+                print(f"Scoring failed for {cid}: {error}")
 
         # =====================================================
-        # STEP 5 — SORT DETERMINISTICALLY SCORED CANDIDATES
+        # STEP 5 — SORT & DB BATCH WRITE
         # =====================================================
+        # Default sort by classic score (frontend will toggle this)
         normal_ranked.sort(key=lambda item: item[1]["total_score"], reverse=True)
 
         print(
-            f"[SCORING] {len(normal_ranked)} candidates scored with deterministic score."
+            f"[SCORING] {len(normal_ranked)} candidates scored with both engines."
         )
 
         final_ranked: list[tuple] = []
 
-        # ---- Batch DB writes using deterministic normal scores for all FTS candidates ----
-        for cid, normal_score in normal_ranked:
+        for cid, normal_score, enhanced_result in normal_ranked:
             try:
                 candidate_score = normal_score
 
@@ -2151,31 +2157,27 @@ def screen_job(db: Session, job_id: UUID) -> dict:
                     db.add(result_record)
 
                 for key in [
-                    "mandatory_skills_score",
-                    "experience_score",
-                    "domain_score",
-                    "preferred_skills_score",
-                    "education_score",
-                    "location_score",
-                    "availability_score",
-                    "other_requirements_score",
-                    "total_score",
+                    "mandatory_skills_score", "experience_score", "domain_score",
+                    "preferred_skills_score", "education_score", "location_score",
+                    "availability_score", "other_requirements_score", "total_score",
                     "classification",
                 ]:
                     setattr(result_record, key, candidate_score[key])
 
+                # ---> STORE ENHANCED SCORE IN THE JSONB COLUMN <---
                 result_record.matching_details = {
                     "normal_score": normal_score,
-                    "evaluation": None,
+                    "enhanced_score": enhanced_result,
                 }
+                
                 result_record.semantic_matches = []
                 result_record.missing_requirements = []
                 result_record.strengths = []
                 result_record.concerns = []
-                result_record.screening_model = "deterministic"
-                result_record.screening_version = "v3"
+                result_record.screening_model = "dual_engine"
+                result_record.screening_version = "v4"
 
-                final_ranked.append((jc, candidate_score))
+                final_ranked.append((jc, normal_score, enhanced_result))
                 run.successful_candidates += 1
 
             except Exception as error:
@@ -2191,7 +2193,7 @@ def screen_job(db: Session, job_id: UUID) -> dict:
         # =====================================================
         final_ranked.sort(key=lambda item: item[1]["total_score"], reverse=True)
 
-        for position, (jc, score) in enumerate(final_ranked, 1):
+        for position, (jc, score, enhanced_result) in enumerate(final_ranked, 1):
             jc.ranking_position = position
             jc.is_shortlisted = True
             db.add(jc)
@@ -2324,11 +2326,23 @@ def get_job_candidates(db: Session, job_id: UUID, limit: int | None = None) -> l
             }
         }
 
-        # Reasoning was stored inside matching_details.
+        # Extract Enhanced Scoring data from JSONB
         reasoning = None
+        enhanced_score = None
+        enhanced_classification = None
+        enhanced_reasoning = None
+        enhanced_breakdown = {}
 
         if screening.matching_details:
-            reasoning = screening.matching_details.get("evaluation")
+            enhanced_data = screening.matching_details.get("enhanced_score", {})
+            if enhanced_data:
+                enhanced_score = enhanced_data.get("final_score")
+                enhanced_classification = enhanced_data.get("recommendation_status")
+                enhanced_reasoning = enhanced_data.get("recommendation_reason")
+                enhanced_breakdown = enhanced_data.get("score_breakdown", {})
+                
+                # Use enhanced reasoning for the UI
+                reasoning = enhanced_reasoning 
 
         resume = resumes.get(candidate.id)
         resume_url = resume.file_url if resume else None
@@ -2340,12 +2354,9 @@ def get_job_candidates(db: Session, job_id: UUID, limit: int | None = None) -> l
             "email": candidate.email,
             "phone": candidate.phone,
             "resume_url": resume_url,
-
-            # Candidate information for frontend
             "experience_years": (
                 float(candidate.total_experience_years)
-                if candidate.total_experience_years is not None
-                else None
+                if candidate.total_experience_years is not None else None
             ),
             "current_company": candidate.current_company,
             "current_role": candidate.current_role,
@@ -2353,23 +2364,24 @@ def get_job_candidates(db: Session, job_id: UUID, limit: int | None = None) -> l
             "notice_period_days": candidate.notice_period_days,
             "skills": (
                 candidate.normalized_profile.get("skills", [])
-                if candidate.normalized_profile
-                else []
+                if candidate.normalized_profile else []
             ),
             "experience_details": (
                 candidate.normalized_profile.get("experiences", [])
-                if candidate.normalized_profile
-                else []
+                if candidate.normalized_profile else []
             ),
-            # Overall result
+            "status": jc.recruitment_status,
+            
+            # Classic Score
             "score": float(screening.total_score or 0),
             "classification": screening.classification,
-            "status": jc.recruitment_status,
-
-            # Detailed scoring
             "score_breakdown": score_breakdown,
-
-            # AI explanation
+            
+            # Enhanced Score
+            "enhanced_score": enhanced_score,
+            "enhanced_classification": enhanced_classification,
+            "enhanced_breakdown": enhanced_breakdown,
+            
             "reasoning": reasoning
         })
 
