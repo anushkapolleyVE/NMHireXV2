@@ -610,7 +610,13 @@ def run_screening_background(job_id: UUID, mode: str, run_id: UUID):
     try:
         screen_job(db, job_id, mode=mode, run_id=run_id)
     except Exception as exc:
-        db.rollback()
+        # A server-side timeout may have killed this session's connection.
+        # Rollback first, and invalidate it if rollback itself fails.
+        try:
+            db.rollback()
+        except Exception as rollback_error:
+            print(f"Background rollback failed: {rollback_error}")
+            db.invalidate()
         print(f"Background screening failed for run {run_id}: {exc}")
         try:
             run = db.get(ScreeningRun, run_id)

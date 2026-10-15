@@ -217,7 +217,7 @@ function candidateBatchFile(){
 async function pollScreening(jobId,runId){
  let failures=0;
  while(true){
-  await wait(2000);
+  await wait(3000);
   let p;
   try{
    p=await API.screenStatus(jobId,runId);
@@ -506,7 +506,8 @@ function processing(title,sub,screening=false){
  const total=Math.max(0,num(p?.total_candidates)),done=Math.max(0,num(p?.processed_candidates));
  const pct=total>0?clamp(Math.round(done/total*100)):0;
  const stage=String(p?.current_stage||p?.status||'STARTING').replaceAll('_',' ');
- const progressUI=p?`<div class="live-progress"><div class="live-progress-label"><strong>${esc(stage)}</strong><span>${total?`${done.toLocaleString()} / ${total.toLocaleString()} · ${pct}%`:'Preparing candidate pool…'}</span></div><div class="live-progress-track" role="progressbar" aria-label="Screening progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><i style="width:${pct}%"></i></div><div class="live-progress-foot"><span>Successful: ${num(p.successful_candidates).toLocaleString()}</span><span>Failed: ${num(p.failed_candidates).toLocaleString()}</span></div></div>`:'';
+ const remaining=Math.max(0,total-done);
+ const progressUI=p?`<div class="live-progress"><div class="live-progress-label"><strong>${esc(stage)}</strong><span>${total?`${done.toLocaleString()} of ${total.toLocaleString()} processed · ${pct}%`:'Preparing candidate pool…'}</span></div><div class="live-progress-track" role="progressbar" aria-label="Screening progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><i style="width:${pct}%"></i></div><div class="live-progress-foot"><span>Completed: ${done.toLocaleString()}</span><span>Remaining: ${remaining.toLocaleString()}</span></div><div class="live-progress-foot" style="margin-top:6px"><span>Successful: ${num(p.successful_candidates).toLocaleString()}</span><span>Failed: ${num(p.failed_candidates).toLocaleString()}</span></div></div>`:'';
  return `<div class="processing"><div class="spin-blob">${ic(screening?'users':'sparkles',44)}</div><h4>${esc(title)}</h4><p>${esc(sub)}</p>${progressUI||'<div class="progress-line"></div>'}<div class="timer">${screening?`Elapsed · <span data-elapsed>${mmss(S.elapsed)}</span>`:'Reading and structuring your requirements'}</div></div>`;
 }
 function metric(label,value,note,color){return `<div class="metric" style="--accent:${color||'#85ebca'}"><small>${esc(label)}</small><strong class="accent">${esc(value)}</strong><span class="mini">${esc(note)}</span></div>`;}

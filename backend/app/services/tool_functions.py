@@ -1989,6 +1989,9 @@ def screen_job(db: Session, job_id: UUID, mode: str = "dual", run_id: UUID | Non
     """
     if mode not in {"classic", "enhanced", "benchmark", "dual"}:
         raise ValueError(f"Unsupported screening mode: {mode}")
+    # Keep prefetched ORM column values available after committing read transactions.
+    # The long Enhanced AI evaluation must not keep a transaction open.
+    db.expire_on_commit = False
     job = db.get(Job, job_id)
     if not job or not job.requirements:
         raise ValueError("Job or extracted requirements not found")
@@ -2055,164 +2058,158 @@ def screen_job(db: Session, job_id: UUID, mode: str = "dual", run_id: UUID | Non
         run.current_stage = "SCORING"
         db.commit()  # Release the initial transaction lock!
 
-        final_ranked: list[tuple] = []
+        # Store identifiers and numbers, not long-lived JobCandidate ORM instances.
+        final_ranked: list[tuple[UUID, float]] = []
         batch_size = 50
 
         print(f"[SCORING] Starting evaluation of {len(candidate_ids)} candidates in batches of {batch_size}. Mode: {mode}.")
 
         for i in range(0, len(candidate_ids), batch_size):
             chunk_ids = candidate_ids[i:i + batch_size]
-            
-            # 1. Fetch Candidates
-            candidates = db.scalars(
-                select(Candidate).where(Candidate.id.in_(chunk_ids))
-            ).all()
-            candidate_map: dict = {c.id: c for c in candidates}
 
-            # 2. Bulk Fetch Skills
-            all_skills = db.scalars(
-                select(CandidateSkill).where(CandidateSkill.candidate_id.in_(chunk_ids))
-            ).all()
-            skills_map: dict = {}
+            # Prefetch this batch in a few SQL queries, rather than N+1 queries.
+            candidates = db.scalars(select(Candidate).where(Candidate.id.in_(chunk_ids))).all()
+            candidate_map = {c.id: c for c in candidates}
+
+            all_skills = db.scalars(select(CandidateSkill).where(CandidateSkill.candidate_id.in_(chunk_ids))).all()
+            skills_map = {}
             for s in all_skills:
                 skills_map.setdefault(s.candidate_id, []).append(s)
 
-            # 3. Bulk Fetch Experiences
-            all_experiences = db.scalars(
-                select(CandidateExperience).where(CandidateExperience.candidate_id.in_(chunk_ids))
-            ).all()
-            experiences_map: dict = {}
+            all_experiences = db.scalars(select(CandidateExperience).where(CandidateExperience.candidate_id.in_(chunk_ids))).all()
+            experiences_map = {}
             for e in all_experiences:
                 experiences_map.setdefault(e.candidate_id, []).append(e)
 
-            # 4. Bulk Fetch Educations
-            all_educations = db.scalars(
-                select(CandidateEducation).where(CandidateEducation.candidate_id.in_(chunk_ids))
-            ).all()
-            educations_map: dict = {}
+            all_educations = db.scalars(select(CandidateEducation).where(CandidateEducation.candidate_id.in_(chunk_ids))).all()
+            educations_map = {}
             for ed in all_educations:
                 educations_map.setdefault(ed.candidate_id, []).append(ed)
 
-            # 5. Bulk Fetch Projects
-            all_projects = db.scalars(
-                select(CandidateProject).where(CandidateProject.candidate_id.in_(chunk_ids))
-            ).all()
-            projects_map: dict = {}
-            for p in all_projects:
-                projects_map.setdefault(p.candidate_id, []).append(p)
+            all_projects = db.scalars(select(CandidateProject).where(CandidateProject.candidate_id.in_(chunk_ids))).all()
+            projects_map = {}
+            for project in all_projects:
+                projects_map.setdefault(project.candidate_id, []).append(project)
 
-            # 6. Score Chunk
-            chunk_ranked: list[tuple] = []
+            # IMPORTANT: Finish the read transaction BEFORE any slow AI calls.
+            # expire_on_commit=False preserves the prefetched scalar/JSON values.
+            db.commit()
+
             for cid in chunk_ids:
                 candidate = candidate_map.get(cid)
-                if not candidate:
+                if candidate is None:
+                    print(f"Candidate missing from database during screening: {cid}")
+                    run.failed_candidates = (run.failed_candidates or 0) + 1
+                    run.processed_candidates = (run.processed_candidates or 0) + 1
+                    db.commit()
                     continue
+
                 try:
                     normal_score = None
                     enhanced_result = None
 
-                    if mode in ["classic", "dual", "benchmark"]:
+                    if mode in {"classic", "dual", "benchmark"}:
                         normal_score = calculate_normal_score(
-                            candidate=candidate,
-                            req=req,
-                            skills_map=skills_map,
-                            experiences_map=experiences_map,
-                            educations_map=educations_map,
+                            candidate=candidate, req=req, skills_map=skills_map,
+                            experiences_map=experiences_map, educations_map=educations_map,
                             projects_map=projects_map,
                         )
-                    
-                    if mode in ["enhanced", "dual", "benchmark"]:
+
+                    if mode in {"enhanced", "dual", "benchmark"}:
+                        # No active PostgreSQL transaction while AI evaluation runs.
                         enhanced_result = run_enhanced_scoring(candidate, req, job)
-                    
-                    chunk_ranked.append((cid, normal_score, enhanced_result))
+
                 except Exception as error:
                     print(f"Scoring failed for {cid}: {error}")
-                    run.failed_candidates += 1
-                    run.processed_candidates += 1
+                    run.failed_candidates = (run.failed_candidates or 0) + 1
+                    run.processed_candidates = (run.processed_candidates or 0) + 1
+                    db.commit()
+                    continue
 
-            # 7. Write Chunk to DB
-            for cid, normal_score, enhanced_result in chunk_ranked:
                 try:
-                    # Keep failed writes isolated: a single candidate must not
-                    # abort the surrounding PostgreSQL batch transaction.
-                    with db.begin_nested():
-                        candidate_score = normal_score or {
-                            "total_score": enhanced_result.get("final_score", 0) if enhanced_result else 0,
-                            "classification": enhanced_result.get("recommendation_status", "not classified") if enhanced_result else "not classified",
-                            "mandatory_skills_score": 0, "experience_score": 0, "domain_score": 0,
-                            "preferred_skills_score": 0, "education_score": 0, "location_score": 0,
-                            "availability_score": 0, "other_requirements_score": 0
-                        }
+                    candidate_score = normal_score or {
+                        "total_score": enhanced_result.get("final_score", 0) if enhanced_result else 0,
+                        "classification": enhanced_result.get("recommendation_status", "not classified") if enhanced_result else "not classified",
+                        "mandatory_skills_score": 0, "experience_score": 0,
+                        "domain_score": 0, "preferred_skills_score": 0,
+                        "education_score": 0, "location_score": 0,
+                        "availability_score": 0, "other_requirements_score": 0,
+                    }
 
-                        jc = db.scalar(
-                            select(JobCandidate).where(
-                                JobCandidate.job_id == job.id,
-                                JobCandidate.candidate_id == cid,
-                            )
+                    # Persist score + progress together. The poller can observe
+                    # 1/47, 2/47, ... rather than waiting until the batch finishes.
+                    jc = db.scalar(select(JobCandidate).where(
+                        JobCandidate.job_id == job_id,
+                        JobCandidate.candidate_id == cid,
+                    ))
+                    if jc is None:
+                        jc = JobCandidate(job_id=job_id, candidate_id=cid)
+                        db.add(jc)
+                        db.flush()
+
+                    jc.eligibility_status = "ELIGIBLE" if candidate_score["total_score"] >= 60 else "INELIGIBLE"
+                    jc.recruitment_status = "SCREENED"
+                    jc.overall_score = candidate_score["total_score"]
+                    jc.classification = candidate_score["classification"]
+
+                    result_record = db.scalar(select(ScreeningResult).where(
+                        ScreeningResult.job_candidate_id == jc.id,
+                    ))
+                    if result_record is None:
+                        result_record = ScreeningResult(
+                            job_candidate_id=jc.id,
+                            classification=candidate_score["classification"],
                         )
-                        if not jc:
-                            jc = JobCandidate(job_id=job.id, candidate_id=cid)
-                            db.add(jc)
-                            db.flush()
+                        db.add(result_record)
 
-                        jc.eligibility_status = "ELIGIBLE" if candidate_score["total_score"] >= 60 else "INELIGIBLE"
-                        jc.recruitment_status = "SCREENED"
-                        jc.overall_score = candidate_score["total_score"]
-                        jc.classification = candidate_score["classification"]
+                    for key in (
+                        "mandatory_skills_score", "experience_score", "domain_score",
+                        "preferred_skills_score", "education_score", "location_score",
+                        "availability_score", "other_requirements_score", "total_score",
+                        "classification",
+                    ):
+                        setattr(result_record, key, candidate_score[key])
 
-                        result_record = db.scalar(
-                            select(ScreeningResult).where(ScreeningResult.job_candidate_id == jc.id)
-                        )
-                        if not result_record:
-                            result_record = ScreeningResult(
-                                job_candidate_id=jc.id,
-                                classification=candidate_score["classification"],
-                            )
-                            db.add(result_record)
+                    result_record.matching_details = {
+                        "run_id": str(run.id),
+                        "normal_score": normal_score,
+                        "enhanced_score": enhanced_result,
+                    }
+                    result_record.semantic_matches = []
+                    result_record.missing_requirements = []
+                    result_record.strengths = []
+                    result_record.concerns = []
+                    result_record.screening_model = mode
+                    result_record.screening_version = "v4"
 
-                        for key in [
-                            "mandatory_skills_score", "experience_score", "domain_score",
-                            "preferred_skills_score", "education_score", "location_score",
-                            "availability_score", "other_requirements_score", "total_score",
-                            "classification",
-                        ]:
-                            setattr(result_record, key, candidate_score[key])
-
-                        result_record.matching_details = {
-                            "run_id": str(run.id),
-                            "normal_score": normal_score,
-                            "enhanced_score": enhanced_result,
-                        }
-                    
-                        result_record.semantic_matches = []
-                        result_record.missing_requirements = []
-                        result_record.strengths = []
-                        result_record.concerns = []
-                        result_record.screening_model = mode
-                        result_record.screening_version = "v4"
-
-                    final_ranked.append((jc, candidate_score, enhanced_result))
-                    run.successful_candidates += 1
+                    run.successful_candidates = (run.successful_candidates or 0) + 1
+                    run.processed_candidates = (run.processed_candidates or 0) + 1
+                    db.commit()  # One completed candidate visible to /screen-status.
+                    final_ranked.append((cid, float(candidate_score["total_score"])))
 
                 except Exception as error:
+                    # Do not continue with potentially expired ORM objects after
+                    # a failed DB write/rollback. Mark the run failed instead.
                     print(f"DB write failed for {cid}: {error}")
-                    run.failed_candidates += 1
+                    raise RuntimeError(f"Database write failed for candidate {cid}: {error}") from error
 
-                run.processed_candidates += 1
+            print(f"[SCORING] Saved progress: {run.processed_candidates} / {len(candidate_ids)}")
 
-            # ---> SCALING FIX: Commit after every batch of 50 <---
-            db.commit()
-            print(f"[SCORING] Finished batch. Progress: {min(i + batch_size, len(candidate_ids))} / {len(candidate_ids)}")
-
-        # =====================================================
-        # STEP 6 — FINAL SORT & RANKING
-        # =====================================================
-        final_ranked.sort(key=lambda item: item[1]["total_score"], reverse=True)
-
-        for position, (jc, score, enhanced_result) in enumerate(final_ranked, 1):
-            jc.ranking_position = position
-            jc.is_shortlisted = True
-            db.add(jc)
+        # Final ranking is calculated from scores successfully committed above.
+        final_ranked.sort(key=lambda item: item[1], reverse=True)
+        rank_ids = [cid for cid, _ in final_ranked]
+        ranking_rows = db.scalars(
+            select(JobCandidate).where(
+                JobCandidate.job_id == job_id,
+                JobCandidate.candidate_id.in_(rank_ids),
+            )
+        ).all() if rank_ids else []
+        ranking_map = {jc.candidate_id: jc for jc in ranking_rows}
+        for position, (cid, _) in enumerate(final_ranked, 1):
+            jc = ranking_map.get(cid)
+            if jc is not None:
+                jc.ranking_position = position
+                jc.is_shortlisted = True
 
         job.status = "ACTIVE"
         run.status = "COMPLETED"
@@ -2229,11 +2226,21 @@ def screen_job(db: Session, job_id: UUID, mode: str = "dual", run_id: UUID | Non
         }
 
     except Exception as exc:
-        db.rollback()
-        run.status = "FAILED"
-        run.error_message = str(exc)
-        run.completed_at = time_now()
-        job.status = "DRAFT"
+        try:
+            db.rollback()
+        except Exception as rollback_error:
+            print(f"Rollback failed during screening cleanup: {rollback_error}")
+            db.invalidate()
+        # A failed transaction expires the old ORM state. Reload in a clean one.
+        failed_run = db.get(ScreeningRun, run.id)
+        if failed_run is not None:
+            failed_run.status = "FAILED"
+            failed_run.current_stage = "FAILED"
+            failed_run.error_message = str(exc)[:4000]
+            failed_run.completed_at = time_now()
+        failed_job = db.get(Job, job_id)
+        if failed_job is not None:
+            failed_job.status = "DRAFT"
         db.commit()
         raise
 
