@@ -14,7 +14,7 @@ Recruiter approval:
 
 from pathlib import Path
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pydantic import BaseModel
 from fastapi import (
@@ -28,16 +28,16 @@ from fastapi import (
 )
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from sqlalchemy import cast, String
+from sqlalchemy import cast, String, select
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Request, Query
 
 import json
 from app.services.naukri_adapter import adapt_naukri_candidate
 from app.services.enhanced.match_score import score_candidates
 
-# --- UPDATED IMPORTS FOR NEW STRUCTURE ---
-from app.core.database import get_db
-from app.models.schema import User, Job, Candidate, JobCandidate, CandidateContact
+from app.core.database import get_db, SessionLocal
+from fastapi import BackgroundTasks
+from app.models.schema import User, Job, Candidate, JobCandidate, CandidateContact, ScreeningRun
 from app.core.config import settings
 from app.core.auth import (
     hash_password,
@@ -51,6 +51,7 @@ from app.services.tool_functions import (
     sync_google_drive,
     create_job,
     screen_job,
+    get_job_candidates,
     get_user_jobs,
     get_user_job_candidates,
     get_admin_jobs,
@@ -600,83 +601,126 @@ async def api_create_job(
 
 
 # ============================================================
-# SCREEN JOB
+# SCREEN JOB & STATUS
 # ============================================================
 
+def run_screening_background(job_id: UUID, mode: str, run_id: UUID):
+    """Execute screening with a separate DB session and persist terminal failures."""
+    db = SessionLocal()
+    try:
+        screen_job(db, job_id, mode=mode, run_id=run_id)
+    except Exception as exc:
+        db.rollback()
+        print(f"Background screening failed for run {run_id}: {exc}")
+        try:
+            run = db.get(ScreeningRun, run_id)
+            if run and run.status != "COMPLETED":
+                run.status = "FAILED"
+                run.current_stage = "FAILED"
+                run.error_message = str(exc)[:4000]
+                run.completed_at = datetime.now(timezone.utc)
+                db.commit()
+        except Exception as status_exc:
+            db.rollback()
+            print(f"Could not persist screening failure for {run_id}: {status_exc}")
+    finally:
+        db.close()
 
-@router.post("/jobs/{job_id}/screen")
+
+@router.post("/jobs/{job_id}/screen", status_code=202)
 def api_screen_job(
     job_id: UUID,
+    background_tasks: BackgroundTasks,
+    mode: str = Query("classic"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Screen candidates for a job.
+    """Queue one screening run. Returns a run ID; results arrive separately."""
+    if mode not in {"classic", "enhanced", "benchmark"}:
+        raise HTTPException(status_code=400, detail="Invalid screening mode")
 
-    Recruiter:
-        Can screen only their own jobs.
-
-    Admin:
-        Can technically screen any job through this endpoint,
-        although the Admin UI should not expose Match Agent.
-    """
-
-    job = db.get(
-        Job,
-        job_id,
-    )
-
+    # Lock the job row until the queued run is committed to prevent double starts.
+    job = db.scalar(select(Job).where(Job.id == job_id).with_for_update())
     if not job:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found",
-        )
+        raise HTTPException(status_code=404, detail="Job not found")
+    if user.role != "ADMIN" and job.created_by != user.id:
+        raise HTTPException(status_code=403, detail="You do not have access to this job")
+    if user.role == "RECRUITER" and user.status != "APPROVED":
+        raise HTTPException(status_code=403, detail="Recruiter account is not approved")
+    if not job.requirements:
+        raise HTTPException(status_code=400, detail="Job requirements have not been extracted")
 
-    # --------------------------------------------------------
-    # Ownership check
-    # --------------------------------------------------------
+    existing = db.scalar(
+        select(ScreeningRun).where(
+            ScreeningRun.job_id == job_id,
+            ScreeningRun.status.in_(["QUEUED", "RUNNING"]),
+        ).order_by(ScreeningRun.started_at.desc().nullslast())
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Screening already in progress (run {existing.id})")
 
-    if (
-        user.role != "ADMIN"
-        and job.created_by != user.id
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="You do not have access to this job",
-        )
+    run = ScreeningRun(job_id=job_id, status="QUEUED", current_stage="QUEUED")
+    db.add(run)
+    db.commit()
+    background_tasks.add_task(run_screening_background, job_id, mode, run.id)
+    return {"message": "Screening queued", "job_id": str(job_id),
+            "run_id": str(run.id), "status": "QUEUED", "mode": mode}
 
-    # --------------------------------------------------------
-    # Recruiter approval
-    # --------------------------------------------------------
 
-    if (
-        user.role == "RECRUITER"
-        and user.status != "APPROVED"
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Recruiter account is not approved",
-        )
+@router.get("/jobs/{job_id}/screen-status")
+def api_screen_status(
+    job_id: UUID,
+    run_id: UUID = Query(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return progress for exactly the authorized screening run."""
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if user.role != "ADMIN" and job.created_by != user.id:
+        raise HTTPException(status_code=403, detail="You do not have access to this job")
 
-    # --------------------------------------------------------
-    # Run AI screening
-    # --------------------------------------------------------
+    run = db.scalar(select(ScreeningRun).where(
+        ScreeningRun.id == run_id, ScreeningRun.job_id == job_id
+    ))
+    if not run:
+        raise HTTPException(status_code=404, detail="Screening run not found")
+    return {
+        "run_id": str(run.id),
+        "status": run.status,
+        "current_stage": run.current_stage,
+        "processed_candidates": run.processed_candidates or 0,
+        "total_candidates": run.total_candidates or 0,
+        "successful_candidates": run.successful_candidates or 0,
+        "failed_candidates": run.failed_candidates or 0,
+        "error_message": run.error_message,
+    }
 
-    try:
 
-        return screen_job(
-            db,
-            job_id,
-        )
+@router.get("/jobs/{job_id}/screen-results")
+def api_screen_results(
+    job_id: UUID,
+    run_id: UUID = Query(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return only the candidates scored by this completed run."""
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if user.role != "ADMIN" and job.created_by != user.id:
+        raise HTTPException(status_code=403, detail="You do not have access to this job")
+    run = db.scalar(select(ScreeningRun).where(
+        ScreeningRun.id == run_id, ScreeningRun.job_id == job_id
+    ))
+    if not run:
+        raise HTTPException(status_code=404, detail="Screening run not found")
+    if run.status != "COMPLETED":
+        raise HTTPException(status_code=409, detail=f"Screening is {run.status.lower()}")
+    return {"run_id": str(run.id), "job_id": str(job_id),
+            "candidates": get_job_candidates(db, job_id, run_id=run.id)}
 
-    except Exception as exc:
-
-        db.rollback()
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        )
 
 # ============================================================
 # SCREEN BATCH (NAUKRI JSON)

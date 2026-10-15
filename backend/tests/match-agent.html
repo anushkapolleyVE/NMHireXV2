@@ -99,6 +99,14 @@ button,input,textarea{font:inherit}button{cursor:pointer}button:disabled{opacity
 .json-source-note{font-size:10px;color:var(--muted);margin:11px 0 0;line-height:1.6}
 .source-indicator{display:inline-block;margin-left:7px;color:var(--mint);font-size:10px;font-weight:800}
 @media(max-width:480px){.candidate-source{padding:12px}.source-choice{font-size:10px;padding:9px 6px}.json-method{font-size:10px}}
+.engine-hint{display:flex;gap:8px;align-items:flex-start;color:var(--muted);font-size:11px;line-height:1.6;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:#ffffff06;margin:0 0 13px}.engine-hint svg{flex:0 0 auto;color:var(--blue);margin-top:1px}
+/* Background screening progress (database modes only). */
+.live-progress{max-width:385px;margin:27px auto 15px;text-align:left}
+.live-progress-label,.live-progress-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:11px;color:var(--muted)}
+.live-progress-label strong{font-size:11px;color:var(--mint);text-transform:capitalize}
+.live-progress-track{height:9px;margin:12px 0;background:#ffffff13;border:1px solid var(--line);border-radius:100px;overflow:hidden}
+.live-progress-track i{display:block;height:100%;background:linear-gradient(90deg,var(--mint),var(--blue));border-radius:100px;transition:width .25s ease}
+.live-progress-foot{font-size:10px}
 </style>
 </head>
 <body>
@@ -107,7 +115,7 @@ button,input,textarea{font:inherit}button{cursor:pointer}button:disabled{opacity
 <div id="modal"></div>
 <div id="toast-root" role="status" aria-live="polite"></div>
 <script>
-/* Existing NMHireXV2 API routes; both scoring engines are returned by /screen. */
+/* Mode-aware NMHireXV2 API routes: run only the selected scoring engine(s). */
 const CONFIG={API_BASE:location.protocol==='file:'?'http://localhost:8000':'',DEV_STAGE:'production',STAGE_NUMBER:''};
 const getToken=()=>localStorage.getItem('token');
 function logout(){localStorage.removeItem('token');render();}
@@ -123,7 +131,9 @@ const API={
  async login(email,password){const r=await this._req('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({username:email,password})});localStorage.setItem('token',r.access_token);return r;},
  createJob(file){const f=new FormData();f.append('file',file);return this._req('/api/jobs',{method:'POST',body:f});},
 createJobFromText(text){const f=new FormData();f.append('jd_text',text);return this._req('/api/jobs',{method:'POST',body:f});},
- screenJob(id){return this._req(`/api/jobs/${encodeURIComponent(id)}/screen`,{method:'POST'});},
+ screenJob(id,mode){if(!['classic','enhanced','benchmark'].includes(mode))throw new Error('Choose a valid scoring mode.');return this._req(`/api/jobs/${encodeURIComponent(id)}/screen?mode=${encodeURIComponent(mode)}`,{method:'POST'});},
+ screenStatus(id,runId){return this._req(`/api/jobs/${encodeURIComponent(id)}/screen-status?run_id=${encodeURIComponent(runId)}`);},
+ screenResults(id,runId){return this._req(`/api/jobs/${encodeURIComponent(id)}/screen-results?run_id=${encodeURIComponent(runId)}`);},
  screenBatch(id, file){const f=new FormData();f.append('file',file);return this._req(`/api/jobs/${encodeURIComponent(id)}/screen-batch`,{method:'POST',body:f});},
  getJobCandidates(id){return this._req(`/api/user/jobs/${encodeURIComponent(id)}/candidates`);},
  updateCandidateStatus(jobId,cid,status,phone){return this._req(`/api/user/jobs/${encodeURIComponent(jobId)}/candidates/${encodeURIComponent(cid)}/status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,target_phone:phone})});}
@@ -139,22 +149,31 @@ const skillName=s=>s==null?'':typeof s==='object'?(s.skill_name||s.normalized_sk
 const list=v=>Array.isArray(v)?v.map(skillName).filter(Boolean):[];
 const candidateId=(c,i)=>c.candidate_id||c.id||String(i);
 const initials=s=>String(s||'C').split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase();
-const MODE={classic:{title:'Classic',name:'Classic matching',desc:'Trusted structured screening and weighted scoring.',color:'#89acff',icon:'layers'},enhanced:{title:'Enhanced',name:'Enhanced intelligence',desc:'Richer skills, role alignment and AI-assisted adjudication.',color:'#72efd0',icon:'sparkles'},benchmark:{title:'Benchmark',name:'Benchmark lab',desc:'Compare both engines on the same candidate pool.',color:'#c0a4ff',icon:'chart'}};
+const MODE={classic:{title:'Classic',name:'Classic matching',desc:'Runs only the deterministic Classic scoring engine on database candidates.',color:'#89acff',icon:'layers'},enhanced:{title:'Enhanced',name:'Enhanced intelligence',desc:'Runs only Enhanced scoring, using database candidates or candidate JSON.',color:'#72efd0',icon:'sparkles'},benchmark:{title:'Benchmark',name:'Benchmark lab',desc:'Runs Classic and Enhanced together for a true same-pool comparison.',color:'#c0a4ff',icon:'chart'}};
 const ICON={layers:'<rect x="4" y="5" width="16" height="14" rx="3"/><path d="M8 9h8M8 13h5"/>',sparkles:'<path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3Z"/><path d="m19 17 .7 2.3L22 20l-2.3.7L19 23l-.7-2.3L16 20l2.3-.7L19 17ZM4 17l.8 1.6L6.5 19l-1.7.5L4 21l-.8-1.5L1.5 19l1.7-.4L4 17Z"/>',chart:'<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M7 16v-3m5 3V8m5 8v-5"/>',check:'<path d="m5 12 4 4L19 6"/>',arrow:'<path d="M5 12h14m-6-6 6 6-6 6"/>',upload:'<path d="M12 16V4m-5 5 5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',search:'<circle cx="11" cy="11" r="7"/><path d="m16.5 16.5 4 4"/>',file:'<path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2-2h12a2 2 0 0 0 2-2V10Z"/><path d="M13 3v7h7M8 15h8m-8 3h5"/>',close:'<path d="M5 5 19 19M19 5 5 19"/>',users:'<circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2M18 11a3 3 0 0 0 0-6m3 15v-2a6 6 0 0 0-4-5.7"/>',clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',reset:'<path d="M4 11a8 8 0 1 1 3 7M4 4v7h7"/>',external:'<path d="M14 4h6v6m0-6-9 9"/><path d="M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5"/>',filter:'<path d="M4 7h16M7 12h10m-7 5h4"/>',bolt:'<path d="m13 2-9 12h7l-1 8 10-12h-7z"/>',info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/>',heart:'<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z"/>'};
 function ic(name,size=18){return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[name]||ICON.sparkles}</svg>`;}
 const fmtExp=r=>{const a=r?.minimum_experience,b=r?.maximum_experience;if(a!=null&&b!=null)return `${a}–${b} years`;if(a!=null)return `${a}+ years`;if(b!=null)return `Up to ${b} years`;return 'Not specified';};
 const fmtNotice=r=>{const v=r?.notice_period_days;return v==null||v===''?'Not specified':Number(v)===0?'Immediate':Number.isFinite(Number(v))?`${v} days`:String(v);};
 function resumeUrl(url){if(typeof url!=='string')return null;let m=url.match(/drive\.google\.com\/file\/d\/([\w-]+)/);if(m)return `https://drive.google.com/file/d/${m[1]}/view`;m=url.match(/[?&]id=([\w-]{25,})/);if(m)return `https://drive.google.com/file/d/${m[1]}/view`;try{const u=new URL(url);return ['https:','http:'].includes(u.protocol)?u.href:null;}catch{return null;}}
-const S={file:null,jsonFile:null,jsonText:'',jsonInputMethod:'paste',useJsonBatch:false,screenSource:'database',jobTitle:'',jdText:'',job:null,requirements:null,jobId:null,status:'Draft',analyzing:false,searching:false,elapsed:0,took:null,searchComplete:false,error:'',candidates:[],contacted:{},waContacted:{},queueReady:false,mode:'classic',query:'',sort:'score',showAll:true};
+const S={file:null,jsonFile:null,jsonText:'',jsonInputMethod:'paste',useJsonBatch:false,screenSource:'database',lastScreenMode:null,jobTitle:'',jdText:'',job:null,requirements:null,jobId:null,status:'Draft',analyzing:false,searching:false,elapsed:0,took:null,searchComplete:false,error:'',candidates:[],contacted:{},waContacted:{},queueReady:false,mode:'classic',query:'',sort:'score',showAll:true,runId:null,progress:null,visibleCount:50};
 let tick=null,toastTimer=null;
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 function timerStart(){clearInterval(tick);S.elapsed=0;tick=setInterval(()=>{S.elapsed++;document.querySelectorAll('[data-elapsed]').forEach(e=>e.textContent=mmss(S.elapsed));},1000);}
 function timerStop(){clearInterval(tick);tick=null;}
 function toast(message,error=false){const el=document.getElementById('toast-root');el.innerHTML=`<div class="toastbox ${error?'error-toast':''}">${esc(message)}</div>`;clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.innerHTML='',4300);}
 function topScroll(id){document.getElementById(id)?.scrollIntoView({behavior:'smooth',block:'start'});}
-function modeSet(mode){if(!MODE[mode])return;S.mode=mode;S.sort='score';render();}
-function resetSearch(){if(S.searching||S.analyzing)return;Object.assign(S,{file:null,jsonFile:null,jsonText:'',jsonInputMethod:'paste',useJsonBatch:false,screenSource:'database',jobTitle:'',jdText:'',job:null,requirements:null,jobId:null,status:'Draft',searchComplete:false,candidates:[],queueReady:false,took:null,elapsed:0,error:'',query:'',sort:'score'});render();topScroll('intake');}
+function modeSet(mode){
+ if(!MODE[mode]||S.searching||S.analyzing||S.mode===mode)return;
+ const hadResults=S.searchComplete;
+ S.mode=mode;S.sort='score';S.query='';
+ // A new selection is a NEW backend run, not a filter over previously computed scores.
+ if(hadResults){S.searchComplete=false;S.candidates=[];S.lastScreenMode=null;S.screenSource='database';S.took=null;S.status=S.requirements?'Criteria ready':'Draft';}
+ render();
+ if(hadResults)toast(`${MODE[mode].title} selected. Click Screen to run the selected engine${mode==='benchmark'?'s':''}.`);
+}
+function resetSearch(){if(S.searching||S.analyzing)return;Object.assign(S,{file:null,jsonFile:null,jsonText:'',jsonInputMethod:'paste',useJsonBatch:false,screenSource:'database',lastScreenMode:null,jobTitle:'',jdText:'',job:null,requirements:null,jobId:null,status:'Draft',searchComplete:false,candidates:[],queueReady:false,took:null,elapsed:0,error:'',query:'',sort:'score',runId:null,progress:null,visibleCount:50});render();topScroll('intake');}
 async function analyze(){S.error='';if(S.searching||S.analyzing)return;if(!S.file&&!S.jdText.trim()){S.error='Upload a JD or paste a job description to continue.';render();return;}
- S.analyzing=true;S.status='Reading JD';S.requirements=null;S.searchComplete=false;S.candidates=[];S.jobId=null;S.screenSource='database';render();
+ S.analyzing=true;S.status='Reading JD';S.requirements=null;S.searchComplete=false;S.candidates=[];S.jobId=null;S.runId=null;S.progress=null;S.screenSource='database';render();
  try{const r=S.file?await API.createJob(S.file):await API.createJobFromText(S.jdText.trim());S.job=r;S.jobId=r.job_id;S.requirements=r.requirements||{};S.jobTitle=r.requirements?.job_title||r.title||S.jobTitle||'Job description';S.status='Criteria ready';toast('Job description parsed successfully.');}
  catch(e){S.error=e.message||'Could not analyze JD.';S.status='Draft';}
  finally{S.analyzing=false;render();}
@@ -177,10 +196,13 @@ function validateCandidateJson(text){
  if(new Blob([text]).size>10*1024*1024)return {ok:false,message:'Candidate JSON must be 10 MB or smaller.'};
  let value;
  try{value=JSON.parse(text);}catch(e){return {ok:false,message:`Invalid JSON: ${e.message}`};}
- if(!value||typeof value!=='object'||(Array.isArray(value)&&!value.length)||(!Array.isArray(value)&&!Object.keys(value).length))return {ok:false,message:'JSON must contain a non-empty object or array of candidates.'};
- const count=jsonCandidateCount(value);
- if(count===0)return {ok:false,message:'The candidate list in this JSON is empty.'};
- return {ok:true,count,message:count===null?'Valid JSON syntax. Candidate structure will be checked by the screening backend.':`Valid JSON syntax · ${count} candidate ${count===1?'entry':'entries'} found.`};
+ // /screen-batch reads payload.candidates. Other shapes cause a 500 or an empty batch.
+ if(!value||Array.isArray(value)||typeof value!=='object'||!Array.isArray(value.candidates))
+  return {ok:false,message:'This backend expects an object containing a "candidates" array: {"candidates": [...]}.'};
+ if(!value.candidates.length)return {ok:false,message:'The "candidates" array is empty.'};
+ if(value.candidates.some(c=>!c||typeof c!=='object'||Array.isArray(c)))
+  return {ok:false,message:'Every item in "candidates" must be a candidate object.'};
+ return {ok:true,count:value.candidates.length,message:`Valid JSON · ${value.candidates.length} candidates ready for Enhanced screening.`};
 }
 function activeScreenSource(){return S.mode==='enhanced'&&S.useJsonBatch?'json':'database';}
 function candidateBatchFile(){
@@ -192,6 +214,29 @@ function candidateBatchFile(){
  if(!check.ok)throw new Error(check.message);
  return new File([S.jsonText.trim()],'candidate-batch.json',{type:'application/json'});
 }
+async function pollScreening(jobId,runId){
+ let failures=0;
+ while(true){
+  await wait(2000);
+  let p;
+  try{
+   p=await API.screenStatus(jobId,runId);
+   failures=0;
+  }catch(e){
+   if(/session has expired|log in again|screening run not found|access to this job/i.test(e.message||''))throw e;
+   if(++failures>=6)throw new Error(`Could not retrieve screening progress after multiple attempts: ${e.message}`);
+   S.status='Reconnecting';render();
+   continue;
+  }
+  S.progress=p;
+  const status=String(p.status||'').toUpperCase();
+  S.status=status==='QUEUED'?'Queued':status==='RUNNING'?'Screening':status;
+  render();
+  if(status==='FAILED')throw new Error(p.error_message||'Background screening failed. Check your server logs.');
+  if(status==='COMPLETED')return API.screenResults(jobId,runId);
+  if(!['QUEUED','RUNNING'].includes(status))throw new Error(`Unexpected screening status: ${status||'unknown'}`);
+ }
+}
 async function screen(id=null){
  if(S.searching||S.analyzing)return;
  S.error='';const jid=id||S.jobId;
@@ -200,21 +245,35 @@ async function screen(id=null){
  if(source==='json'){
   try{batchFile=candidateBatchFile();}catch(e){S.error=e.message;render();return;}
  }
- S.jobId=jid;S.searching=true;S.searchComplete=false;S.status='Screening';S.candidates=[];timerStart();render();
+ const runMode=S.mode;
+ S.jobId=jid;S.searching=true;S.searchComplete=false;S.status='Starting';
+ S.candidates=[];S.lastScreenMode=null;S.runId=null;S.progress=null;S.visibleCount=50;
+ timerStart();render();
  try{
-  // Database: /screen; candidate JSON (file or pasted): /screen-batch.
-  // Never query the database as a silent fallback when JSON screening fails.
-  const r=source==='json'?await API.screenBatch(jid,batchFile):await API.screenJob(jid);
-  const rows=Array.isArray(r)?r:(r?.top_10??r?.candidates??r?.results??r?.data?.candidates??r?.data?.top_10);
-  if(!Array.isArray(rows))throw new Error('Screening succeeded, but the backend did not return a candidate list. Expected top_10 or candidates.');
-  S.candidates=candidateList(rows);S.screenSource=source;S.searchComplete=true;S.status='Complete';S.took=S.elapsed;
-  toast(`Screening complete · ${S.candidates.length} candidates returned from ${source==='json'?'your JSON':'the database'}.`);
- }
- catch(e){S.status='Criteria ready';S.error=e.message||'Screening failed.';}
+  let response;
+  if(source==='json'){
+   // JSON batches still use the synchronous Enhanced-only endpoint.
+   response=await API.screenBatch(jid,batchFile);
+  }else{
+   // Database screening is queued: first POST, then poll by unique run ID.
+   const started=await API.screenJob(jid,runMode);
+   if(!started?.run_id)throw new Error('The backend did not return a run_id. Deploy the updated routes.py first.');
+   S.runId=started.run_id;
+   S.status='Queued';
+   S.progress={status:'QUEUED',current_stage:'QUEUED',processed_candidates:0,total_candidates:0,successful_candidates:0,failed_candidates:0};
+   render();
+   response=await pollScreening(jid,S.runId);
+  }
+  const rows=Array.isArray(response)?response:(response?.candidates??response?.results??response?.top_10??response?.data?.candidates);
+  if(!Array.isArray(rows))throw new Error('The completed run did not return a candidate list.');
+  S.candidates=candidateList(rows,runMode,source);
+  S.screenSource=source;S.lastScreenMode=runMode;S.searchComplete=true;S.status='Complete';S.took=S.elapsed;
+  toast(`Screening complete · ${S.candidates.length} candidate${S.candidates.length===1?'':'s'} returned.`);
+ }catch(e){S.status='Criteria ready';S.error=e.message||'Screening failed.';}
  finally{timerStop();S.searching=false;render();if(S.searchComplete&&S.candidates.length)setTimeout(()=>topScroll('results'),100);}
 }
 async function loadExisting(id){S.error='';S.jobId=id;S.searching=true;S.searchComplete=false;S.status='Loading';timerStart();render();
- try{const result=await API.getJobCandidates(id);S.candidates=candidateList(Array.isArray(result)?result:result?.candidates||result?.top_10);S.screenSource='database';S.searchComplete=true;S.status='Complete';S.took=null;}
+ try{const result=await API.getJobCandidates(id);S.candidates=candidateList(Array.isArray(result)?result:result?.candidates||result?.top_10,S.mode,'database');S.screenSource='database';S.lastScreenMode=S.mode;S.searchComplete=true;S.status='Complete';S.took=null;}
  catch(e){S.error=e.message||'Failed to fetch candidates.';S.status='Draft';}
  finally{timerStop();S.searching=false;render();if(S.searchComplete&&S.candidates.length)setTimeout(()=>topScroll('results'),120);}
 }
@@ -231,7 +290,7 @@ function onCandidateJsonText(el){
  S.jsonText=el.value;S.error='';
  const info=validateCandidateJson(S.jsonText);
  const node=document.getElementById('candidate-json-validation');
- if(node){node.textContent=el.value.trim()?info.message:'Paste a candidate JSON object or array.';node.className='json-validation '+(el.value.trim()?(info.ok?'valid':'invalid'):'');}
+ if(node){node.textContent=el.value.trim()?info.message:'Paste an object containing a candidates array.';node.className='json-validation '+(el.value.trim()?(info.ok?'valid':'invalid'):'');}
 }
 async function setJsonFile(file){
  if(!file)return;
@@ -263,14 +322,28 @@ function normalizeCandidate(raw){
  }
  return c;
 }
-function candidateList(value){return Array.isArray(value)?value.filter(v=>v&&typeof v==='object'&&!Array.isArray(v)).map(normalizeCandidate):[];}
+function candidateList(value,mode=S.mode,source='database'){
+ if(!Array.isArray(value))return [];
+ return value.filter(v=>v&&typeof v==='object'&&!Array.isArray(v)).map(raw=>{
+  const c=normalizeCandidate(raw);
+  // The backend stores an Enhanced fallback in legacy total_score columns.
+  // Never present that fallback as a second (Classic) scoring run.
+  if(mode==='enhanced'||source==='json'){
+   c.score=null;c.classification=null;c.score_breakdown={};
+  }
+  if(mode==='classic'){
+   c.enhanced_score=null;c.enhanced_classification=null;c.enhanced_breakdown={};c.reasoning=null;
+  }
+  return c;
+ });
+}
 function enhancedAvailable(c){return safeNumber(c.enhanced_score)!==null;}
 function scoreFor(c,mode=S.mode){return mode==='enhanced'?safeNumber(c.enhanced_score):safeNumber(c.score);}
 function allEnhanced(){return S.candidates.filter(enhancedAvailable);}
 function ranks(field){return [...S.candidates].filter(c=>safeNumber(c[field])!=null).sort((a,b)=>num(b[field])-num(a[field])).map(c=>candidateId(c,S.candidates.indexOf(c)));}
 function rankFor(c,field){const j=S.candidates.indexOf(c);return ranks(field).indexOf(candidateId(c,j))+1;}
 function average(vals){const nums=vals.filter(v=>v!=null&&Number.isFinite(Number(v)));return nums.length?nums.reduce((a,b)=>a+Number(b),0)/nums.length:null;}
-function statData(){const available=allEnhanced();const classicAvg=average(S.candidates.map(c=>scoreFor(c,'classic'))),enhancedAvg=average(available.map(c=>scoreFor(c,'enhanced')));return {available,classicAvg,enhancedAvg,classicStrong:S.candidates.filter(c=>num(c.score)>=80).length,enhancedStrong:available.filter(c=>num(c.enhanced_score)>=80).length,compared:available.length};}
+function statData(){const available=allEnhanced();const both=S.candidates.filter(c=>safeNumber(c.score)!==null&&enhancedAvailable(c));const classicAvg=average(S.candidates.map(c=>scoreFor(c,'classic'))),enhancedAvg=average(available.map(c=>scoreFor(c,'enhanced')));return {available,both,classicAvg,enhancedAvg,classicStrong:S.candidates.filter(c=>safeNumber(c.score)!==null&&num(c.score)>=80).length,enhancedStrong:available.filter(c=>num(c.enhanced_score)>=80).length,compared:both.length};}
 function breakdown(c,mode=S.mode){if(mode==='enhanced')return c.enhanced_breakdown||{};return c.score_breakdown||{};}
 function barItems(c,mode=S.mode){return Object.entries(breakdown(c,mode)).filter(([k,v])=>k!=='decision_audit'&&v!=null&&typeof v==='object'&&'score'in v).map(([key,val])=>({key,score:num(val.score),max:num(val.max_score??val.out_of),pct:val.percentage!=null?clamp(num(val.percentage)):num(val.max_score??val.out_of)>0?clamp(num(val.score)/num(val.max_score??val.out_of)*100):0,active:val.active!==false})).filter(x=>x.active&&x.max>0);}
 const rankBadge=c=>{const v=S.mode==='enhanced'?rankFor(c,'enhanced_score'):S.mode==='classic'?rankFor(c,'score'):rankFor(c,'score');return v>0?`#${v}`:'—';};
@@ -353,7 +426,7 @@ function scoreGauge(score,color){return `<div class="gauge" style="--ring:${colo
 function candidateSummary(c){return [c.current_role,c.current_company?'at '+c.current_company:'',c.location].filter(Boolean).join(' · ')||'Candidate profile';}
 function candidateCard(c){const i=S.candidates.indexOf(c),score=scoreFor(c),enhanced=S.mode==='enhanced';const bars=barItems(c).slice(0,4);const k=candidateId(c,i);const pctColor=score!=null&&score>=75?'#78ebc9':score!=null&&score<55?'#ffba95':'#a3adff';return `<article class="candidate"><div class="candidate-body">
  <div class="candidate-head"><div class="candidate-avatar">${esc(initials(c.name))}</div><div class="candidate-main"><h4>${esc(c.name||'Unnamed candidate')}</h4><div class="candidate-meta">${esc(candidateSummary(c))}</div></div><span class="rank">${rankBadge(c)}</span></div>
- <div class="score-panel">${scoreGauge(score,pctColor)}<div class="score-explain"><small>${enhanced?'Enhanced':'Classic'} match score</small><strong>${score==null?'Not yet available':`${score.toFixed(1)} / 100`}</strong>${score==null?'<span>Run screening with dual-engine backend</span>':statusBadge(c)}</div></div>
+ <div class="score-panel">${scoreGauge(score,pctColor)}<div class="score-explain"><small>${enhanced?'Enhanced':'Classic'} match score</small><strong>${score==null?'Not yet available':`${score.toFixed(1)} / 100`}</strong>${score==null?'<span>Not calculated in this run</span>':statusBadge(c)}</div></div>
  <div class="candidate-details">${c.experience_years!=null?`<span class="badge">${esc(c.experience_years)} years exp.</span>`:''}${c.status?`<span class="badge">${esc(label(c.status))}</span>`:''}${enhanced&&enhancedReason(c)?'<span class="badge good">Reason available</span>':''}</div>
  ${enhanced?reasoningAccordion(c,'card'):''}
  ${bars.length?`<div class="score-bars">${bars.map(b=>`<div class="bar-row"><small title="${esc(label(b.key))}">${esc(label(b.key))}</small><div class="track"><div class="fill" style="width:${b.pct}%"></div></div><b>${Math.round(b.pct)}%</b></div>`).join('')}</div>`:''}
@@ -373,7 +446,7 @@ function compareRow(labelText,a,b){const x=a==null?'—':typeof a==='number'?a.t
 let compareBase=0,compareOther='';
 function openCompare(i){compareBase=i;compareOther='';renderCompare();}
 function renderCompare(){const c=S.candidates[compareBase];if(!c)return;const other=compareOther!==''?S.candidates[Number(compareOther)]:null;const options=S.candidates.map((p,j)=>j===compareBase?'':`<option value="${j}" ${String(j)===String(compareOther)?'selected':''}>${esc(p.name||'Unnamed candidate')}</option>`).join('');
- let body=`<div class="modal-compare"><div class="modal-stat"><small>Candidate A</small><strong>${esc(c.name||'Unnamed')}</strong><div class="score-bars" style="margin-top:13px">${compareRow('Classic',safeNumber(c.score),other?safeNumber(other.score):null)}${compareRow('Enhanced',safeNumber(c.enhanced_score),other?safeNumber(other.enhanced_score):null)}</div></div><div class="modal-stat"><small>Candidate B</small><select class="select" style="width:100%" onchange="compareOther=this.value;renderCompare()"><option value="">Choose candidate…</option>${options}</select><p class="footnote">Select another candidate to compare scores from both engines.</p></div></div>`;
+ let body=`<div class="modal-compare"><div class="modal-stat"><small>Candidate A</small><strong>${esc(c.name||'Unnamed')}</strong><div class="score-bars" style="margin-top:13px">${compareRow('Classic',safeNumber(c.score),other?safeNumber(other.score):null)}${compareRow('Enhanced',safeNumber(c.enhanced_score),other?safeNumber(other.enhanced_score):null)}</div></div><div class="modal-stat"><small>Candidate B</small><select class="select" style="width:100%" onchange="compareOther=this.value;renderCompare()"><option value="">Choose candidate…</option>${options}</select><p class="footnote">Only scores computed in the selected mode are available.</p></div></div>`;
  if(other){const types=S.mode==='benchmark'?['classic','enhanced']: [S.mode==='enhanced'?'enhanced':'classic'];body+=`<div class="section-divider"></div>${types.map(m=>`<h4 style="margin:20px 0 10px">${MODE[m].title} scoring breakdown</h4><div class="comparison-row"><b class="muted">Dimension</b><b>${esc(c.name||'A')}</b><b>${esc(other.name||'B')}</b></div>${Object.keys({...breakdown(c,m),...breakdown(other,m)}).filter(k=>k!=='decision_audit').map(k=>{const a=barItems(c,m).find(x=>x.key===k),b=barItems(other,m).find(x=>x.key===k);return a||b?compareRow(label(k),a?.pct,b?.pct):'';}).join('')}`).join('')}`;}
  modalFrame('Compare talent','Two candidate profiles, side by side.',body);}
 async function contact(i,phone=null){const c=S.candidates[i];if(!c||!S.jobId){toast('Job context is missing.',true);return false;}const k=candidateId(c,i);try{await API.updateCandidateStatus(S.jobId,k,'CONTACTED',phone);S.contacted[k]=true;toast('Candidate successfully added to outreach.');render();return true;}catch(e){toast(e.message||'Unable to update outreach status.',true);return false;}}
@@ -382,13 +455,13 @@ async function sendWhatsapp(i){const c=S.candidates[i];const key=candidateId(c,i
 function nav(){return `<aside class="rail" aria-label="Match mode shortcuts"><a class="brandmark" title="NMHireXV2 Match Studio" href="#intake">N</a><div class="rail-line"></div><div class="rail-links">${['classic','enhanced','benchmark'].map(m=>`<button class="rail-btn ${S.mode===m?'active':''}" onclick="modeSet('${m}')" title="${MODE[m].title} mode" aria-label="Select ${MODE[m].title} mode" aria-pressed="${S.mode===m}">${ic(MODE[m].icon,21)}</button>`).join('')}</div><div class="rail-hint">NMHIREXV2 · MATCH LAB</div></aside>`;}
 function hero(){return `<header class="topbar"><div class="top-left"><span class="crumb">NMHireXV2</span><span class="slash">/</span><span class="crumb"><strong>Match Studio</strong></span></div><div class="top-right"><div class="top-chip"><span class="dot"></span><span class="hide-mobile">Intelligence workspace</span><span class="hide-mobile">·</span> v2</div><div class="avatar">N</div><button class="btn ghost small" onclick="logout()" title="Sign out">Sign out</button></div></header><section class="hero"><div><div class="eyebrow">RECRUITMENT INTELLIGENCE <span class="hyphen">/</span> 03 · MATCH AGENT</div><h1>Find the right people.<br><em>See the whole picture.</em></h1><p>From one job description to a sharper shortlist. Explore three perspectives on candidate fit, built for recruiters who want clarity and control.</p></div><div class="hero-art" aria-hidden="true"><div class="orbit three"></div><div class="orbit two"></div><div class="orbit one"></div><div class="orbit-core">${ic('sparkles',62)}</div><div class="art-pill top">${ic('check',14)} Skill signals <b>✓</b></div><div class="art-pill bottom">${ic('chart',14)} Dual-engine view</div></div></section>`;}
 function steps(){let current=S.searching?3:S.searchComplete?4:S.requirements?2:1;return `<div class="stepper" aria-label="Workflow progress">${[['01','Define role'],['02','Extract criteria'],['03','Run screening'],['04','Review talent']].map(([n,t],i)=>`<div class="step ${current===i+1?'on':current>i+1?'done':''}"><span class="step-num">${current>i+1?'✓':n}</span>${t}</div>${i<3?'<div class="step-line"></div>':''}`).join('')}</div>`;}
-function modes(){return `<section id="modes"><div class="section-header"><div><div class="kicker">YOUR INTELLIGENCE, YOUR WAY</div><h2>Choose your matching lens</h2></div><p>One workflow. Three ways to understand fit.</p></div><div class="mode-grid" role="group" aria-label="Matching engine mode">${Object.entries(MODE).map(([key,m])=>`<button class="mode-card ${S.mode===key?'selected':''}" style="--tint:${m.color}" onclick="modeSet('${key}')" aria-pressed="${S.mode===key}"><div class="mode-head"><span class="mode-icon">${ic(m.icon,20)}</span><span class="mode-indicator">${ic('check',13)}</span></div><div class="mode-name">${m.title}</div><p class="mode-desc">${m.desc}</p></button>`).join('')}</div></section>`;}
+function modes(){return `<section id="modes"><div class="section-header"><div><div class="kicker">YOUR INTELLIGENCE, YOUR WAY</div><h2>Choose your scoring engine</h2></div><p>Each mode runs its own backend pipeline.</p></div><div class="mode-grid" role="group" aria-label="Matching engine mode">${Object.entries(MODE).map(([key,m])=>`<button class="mode-card ${S.mode===key?'selected':''}" style="--tint:${m.color}" onclick="modeSet('${key}')" aria-pressed="${S.mode===key}"><div class="mode-head"><span class="mode-icon">${ic(m.icon,20)}</span><span class="mode-indicator">${ic('check',13)}</span></div><div class="mode-name">${m.title}</div><p class="mode-desc">${m.desc}</p></button>`).join('')}</div></section>`;}
 function candidateSourceUI(busy){
  const jsonSelected=S.useJsonBatch;
  const check=S.jsonInputMethod==='paste'?validateCandidateJson(S.jsonText):null;
  const hint=S.jsonInputMethod==='upload'
-  ?(S.jsonFile?`<span class="json-validation valid">${esc(S.jsonFile.name)} · Ready to screen</span>`:'<span class="json-validation">Choose a .json file containing candidate data.</span>')
-  :`<div id="candidate-json-validation" class="json-validation ${S.jsonText.trim()?(check.ok?'valid':'invalid'):''}">${esc(S.jsonText.trim()?check.message:'Paste a candidate JSON object or array.')}</div>`;
+  ?(S.jsonFile?`<span class="json-validation valid">${esc(S.jsonFile.name)} · Ready to screen</span>`:'<span class="json-validation">Choose a .json file containing {"candidates": [...]}.</span>')
+  :`<div id="candidate-json-validation" class="json-validation ${S.jsonText.trim()?(check.ok?'valid':'invalid'):''}">${esc(S.jsonText.trim()?check.message:'Paste an object containing a candidates array.')}</div>`;
  return `<div class="candidate-source">
   <label class="input-label">Candidate source <span class="input-note">Enhanced screening</span></label>
   <p class="source-description">Choose where candidates come from for this screening run.</p>
@@ -402,13 +475,13 @@ function candidateSourceUI(busy){
     <button type="button" class="json-method ${S.jsonInputMethod==='paste'?'active':''}" aria-pressed="${S.jsonInputMethod==='paste'}" onclick="setJsonInputMethod('paste')" ${busy?'disabled':''}>Paste JSON</button>
     <button type="button" class="json-method ${S.jsonInputMethod==='upload'?'active':''}" aria-pressed="${S.jsonInputMethod==='upload'}" onclick="setJsonInputMethod('upload')" ${busy?'disabled':''}>Upload .json file</button>
    </div>
-   ${S.jsonInputMethod==='paste'?`<textarea id="candidate-json" class="field json-editor" spellcheck="false" placeholder='[\n  {"name": "Candidate A", "skills": ["Python"]}\n]' oninput="onCandidateJsonText(this)" ${busy?'disabled':''}>${esc(S.jsonText)}</textarea>`:`<div class="upload json-upload" ondragover="dragOver(event)" ondragleave="dragLeave(event)" ondrop="dropJsonFile(event)">
+   ${S.jsonInputMethod==='paste'?`<textarea id="candidate-json" class="field json-editor" spellcheck="false" placeholder='{"candidates": [{"name": "Candidate A", "skills": ["Python"]}]}' oninput="onCandidateJsonText(this)" ${busy?'disabled':''}>${esc(S.jsonText)}</textarea>`:`<div class="upload json-upload" ondragover="dragOver(event)" ondragleave="dragLeave(event)" ondrop="dropJsonFile(event)">
     <input type="file" accept=".json,application/json" aria-label="Upload candidate JSON file" onchange="onJsonFile(this)" ${busy?'disabled':''}/>
     <div class="upload-icon">${ic('upload',21)}</div>
     <div><div class="upload-title">${S.jsonFile?esc(S.jsonFile.name):'Drop your .json file or browse'}</div><div class="upload-sub">JSON files only · Maximum 10 MB</div></div>
    </div>`}
    ${hint}
-   <p class="json-source-note">Your JSON is sent as a file to the batch screening API for this job. Database candidates are not used for this run. Use the candidate structure supported by your backend.</p>
+   <p class="json-source-note">The batch endpoint runs Enhanced only and never inserts candidates into the database. Expected JSON format: <code>{&quot;candidates&quot;: [...]}</code>.</p>
   </div>`:`<p class="json-source-note">Default: the backend screens candidates from the database.</p>`}
  </div>`;
 }
@@ -418,25 +491,32 @@ function intakePanel(){const busy=S.analyzing||S.searching;return `<section clas
  <button class="btn full ${S.analyzing?'secondary':'primary'}" onclick="analyze()" ${busy?'disabled':''}>${S.analyzing?ic('clock',17):ic('sparkles',17)} ${S.analyzing?'Extracting requirements…':S.requirements?'Re-analyze job description':'Analyze job description'} ${!S.analyzing?ic('arrow',16):''}</button>
  ${S.requirements?`<div class="parse-panel"><div class="parse-row"><div><strong>${ic('check',15)} Criteria extracted</strong><p>Review your search requirements before matching.</p></div><button class="btn small ghost" onclick="openJD()">Review ${ic('arrow',13)}</button></div></div>
  <div class="section-divider"></div>
- ${S.mode==='enhanced'?candidateSourceUI(busy):''}
- <button class="btn full secondary" onclick="screen()" ${busy||!S.jobId?'disabled':''}>${ic('bolt',18)} ${S.searching?'Screening…':activeScreenSource()==='json'?'Screen JSON candidates':'Screen database candidates'} ${ic('arrow',16)}</button>`:''}
+ ${S.mode==='enhanced'?candidateSourceUI(busy):`<p class="engine-hint">${ic('info',15)} ${S.mode==='benchmark'?'Benchmark runs both engines on database candidates.':'Classic runs the deterministic engine only, on database candidates.'} Candidate JSON is supported in Enhanced mode only.</p>`}
+ <button class="btn full secondary" onclick="screen()" ${busy||!S.jobId?'disabled':''}>${ic('bolt',18)} ${S.searching?'Screening…':activeScreenSource()==='json'?'Screen JSON candidates (Enhanced)':`Screen ${MODE[S.mode].title} · Database`} ${ic('arrow',16)}</button>`:''}
  ${(S.requirements||S.searchComplete)?`<button class="btn full ghost" style="margin-top:10px" ${busy?'disabled':''} onclick="resetSearch()">${ic('reset',15)} Start a new search</button>`:''}
  </div></section>`;}
 function rightPanel(){const mode=MODE[S.mode];let main='';if(S.analyzing){main=processing('Analyzing your job description…','Identifying requirements, skills and experience signals.');}
- else if(S.searching){main=processing('Finding your strongest matches…',activeScreenSource()==='json'?'Screening the candidate profiles supplied in your JSON batch.':'The backend is screening candidates from the database.',true);}
- else if(S.searchComplete){const d=statData();const val=S.mode==='enhanced'?d.enhancedStrong:d.classicStrong;main=`<div class="done-panel"><div class="done-icon">${ic('check',47)}</div><div class="eyebrow">SCREENING COMPLETE</div><h4>The shortlist is ready.</h4><p>Explore ranked candidates and switch between modes to see how the scoring changes.</p><div class="done-numbers"><div><b>${S.candidates.length}</b><small>Profiles returned</small></div><div><b class="mint">${S.mode==='enhanced'&&d.compared===0?'—':val}</b><small>Matches ≥80</small></div><div><b>${S.took!=null?mmss(S.took):'—'}</b><small>Elapsed</small></div></div><button class="btn primary" onclick="topScroll('results')" ${!S.candidates.length?'disabled':''}>Explore candidates ${ic('arrow',16)}</button>${S.mode!=='classic'&&d.compared===0&&S.candidates.length?'<div class="notice">Enhanced scores are missing from these results. Run screening with the dual-engine backend to populate them.</div>':''}</div>`;}
+ else if(S.searching){main=processing(`Running ${MODE[S.mode].title} screening…`,activeScreenSource()==='json'?'Enhanced engine is screening your JSON batch.':S.mode==='benchmark'?'Both Classic and Enhanced engines are scoring database candidates.':`Only the ${MODE[S.mode].title} engine is scoring database candidates.`,true);}
+ else if(S.searchComplete){const d=statData();const val=S.mode==='enhanced'?d.enhancedStrong:d.classicStrong;main=`<div class="done-panel"><div class="done-icon">${ic('check',47)}</div><div class="eyebrow">SCREENING COMPLETE</div><h4>The shortlist is ready.</h4><p>${MODE[S.mode].title} screening completed. To evaluate another mode, select it and screen again.</p><div class="done-numbers"><div><b>${S.candidates.length}</b><small>Profiles returned</small></div><div><b class="mint">${S.mode==='enhanced'&&d.available.length===0?'—':val}</b><small>Matches ≥80</small></div><div><b>${S.took!=null?mmss(S.took):'—'}</b><small>Elapsed</small></div></div><button class="btn primary" onclick="topScroll('results')" ${!S.candidates.length?'disabled':''}>Explore candidates ${ic('arrow',16)}</button>${S.mode!=='classic'&&d.available.length===0&&S.candidates.length?'<div class="notice">Enhanced scores are missing from this run. Verify the Enhanced engine and try again.</div>':''}</div>`;}
  else if(S.requirements){const r=S.requirements;main=`<div class="criteria-tiles"><div class="criteria-tile"><small>ROLE TITLE</small><strong>${esc(r.job_title||S.jobTitle||'Not specified')}</strong></div><div class="criteria-tile"><small>EXPERIENCE</small><strong>${esc(fmtExp(r))}</strong></div><div class="criteria-tile"><small>WORK LOCATION</small><strong>${esc(r.location||'Not specified')}</strong></div><div class="criteria-tile"><small>WORK MODE</small><strong>${esc(r.work_mode||'Not specified')}</strong></div></div><div style="padding:0 26px 25px"><div class="mini-label" style="margin:0 0 12px">MANDATORY SKILLS</div>${chips(list(r.mandatory_skills))}<div class="load-cta"><button class="btn small ghost" onclick="openJD()">View all criteria ${ic('arrow',15)}</button></div></div>`;}
  else{main=`<div class="empty-art" aria-hidden="true"><div class="empty-circle"></div><div class="empty-doc"></div><div class="empty-doc"></div><div class="empty-doc"></div></div><div class="empty-inner"><div class="eyebrow">READY WHEN YOU ARE</div><h4>Clarity starts with a job description.</h4><p>Bring your role requirements to life. Once analyzed, this workspace becomes your command center for every candidate decision.</p><div class="feature-chips"><span>Skills intelligence</span><span>Transparent scoring</span><span>Better comparisons</span></div></div>`;}
  return `<section class="panel result-panel"><div class="result-head"><div><div class="mini-label">02 / MATCH INTELLIGENCE</div><h3>${S.requirements&&!S.searchComplete&&!S.analyzing&&!S.searching?'Your search blueprint':S.searchComplete?'Your matching overview':'Insights, in focus.'}</h3></div><span class="mode-tag" style="color:${mode.color};border-color:${mode.color}44;background:${mode.color}12">${ic(mode.icon,13)} ${mode.title.toUpperCase()} MODE</span></div>${main}</section>`;}
-function processing(title,sub,screening=false){return `<div class="processing"><div class="spin-blob">${ic(screening?'users':'sparkles',44)}</div><h4>${esc(title)}</h4><p>${esc(sub)}</p><div class="progress-line"></div><div class="timer">${screening?`Elapsed · <span data-elapsed>${mmss(S.elapsed)}</span>`:'Reading and structuring your requirements'}</div></div>`;}
+function processing(title,sub,screening=false){
+ const p=screening?S.progress:null;
+ const total=Math.max(0,num(p?.total_candidates)),done=Math.max(0,num(p?.processed_candidates));
+ const pct=total>0?clamp(Math.round(done/total*100)):0;
+ const stage=String(p?.current_stage||p?.status||'STARTING').replaceAll('_',' ');
+ const progressUI=p?`<div class="live-progress"><div class="live-progress-label"><strong>${esc(stage)}</strong><span>${total?`${done.toLocaleString()} / ${total.toLocaleString()} · ${pct}%`:'Preparing candidate pool…'}</span></div><div class="live-progress-track" role="progressbar" aria-label="Screening progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><i style="width:${pct}%"></i></div><div class="live-progress-foot"><span>Successful: ${num(p.successful_candidates).toLocaleString()}</span><span>Failed: ${num(p.failed_candidates).toLocaleString()}</span></div></div>`:'';
+ return `<div class="processing"><div class="spin-blob">${ic(screening?'users':'sparkles',44)}</div><h4>${esc(title)}</h4><p>${esc(sub)}</p>${progressUI||'<div class="progress-line"></div>'}<div class="timer">${screening?`Elapsed · <span data-elapsed>${mmss(S.elapsed)}</span>`:'Reading and structuring your requirements'}</div></div>`;
+}
 function metric(label,value,note,color){return `<div class="metric" style="--accent:${color||'#85ebca'}"><small>${esc(label)}</small><strong class="accent">${esc(value)}</strong><span class="mini">${esc(note)}</span></div>`;}
 function resultsMetrics(){const d=statData(),benchmark=S.mode==='benchmark',enhanced=S.mode==='enhanced';let cards=[];
- if(benchmark){const compared=d.available;const shifts=compared.filter(c=>rankFor(c,'score')!==rankFor(c,'enhanced_score')).length;cards=[metric('SCREENED',S.candidates.length,'Candidates in this run','#a1bcff'),metric('DUAL-SCORED',d.compared,'Available for comparison','#74eccb'),metric('CLASSIC AVERAGE',d.classicAvg==null?'—':d.classicAvg.toFixed(1),'Weighted score / 100','#97adff'),metric('ENHANCED AVERAGE',d.enhancedAvg==null?'—':d.enhancedAvg.toFixed(1),'Evidence-fit score / 100','#c2a3ff')];}
+ if(benchmark){const compared=d.both;const shifts=compared.filter(c=>rankFor(c,'score')!==rankFor(c,'enhanced_score')).length;cards=[metric('SCREENED',S.candidates.length,'Candidates in this run','#a1bcff'),metric('DUAL-SCORED',d.compared,'Available for comparison','#74eccb'),metric('CLASSIC AVERAGE',d.classicAvg==null?'—':d.classicAvg.toFixed(1),'Weighted score / 100','#97adff'),metric('ENHANCED AVERAGE',d.enhancedAvg==null?'—':d.enhancedAvg.toFixed(1),'Evidence-fit score / 100','#c2a3ff')];}
  else{const values=enhanced?d.available:S.candidates;const avg=enhanced?d.enhancedAvg:d.classicAvg;const high=enhanced?d.enhancedStrong:d.classicStrong;cards=[metric('SCREENED CANDIDATES',S.candidates.length,S.screenSource==='json'?'From candidate JSON':'From database','#a1bcff'),metric('SCORING COVERAGE',values.length,'With a '+(enhanced?'enhanced':'classic')+' score','#70e7c5'),metric('AVERAGE FIT',avg==null?'—':avg.toFixed(1),'Out of 100','#c3acff'),metric('STRONG MATCHES',high,'Scores at or above 80','#ffc98d')];}
  return `<div class="metrics">${cards.join('')}</div>`;}
 function sortAndFilter(){let arr=[...S.candidates].filter(c=>!S.query||[c.name,c.email,c.current_role,c.current_company,c.location].some(x=>String(x||'').toLowerCase().includes(S.query.toLowerCase())));if(S.sort==='name')arr.sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')));else if(S.sort==='score')arr.sort((a,b)=>num(scoreFor(b,S.mode==='enhanced'?'enhanced':'classic'))-num(scoreFor(a,S.mode==='enhanced'?'enhanced':'classic')));else if(S.sort==='delta')arr.sort((a,b)=>Math.abs(num(b.enhanced_score)-num(b.score))-Math.abs(num(a.enhanced_score)-num(a.score)));return arr;}
 function benchmarkTable(items){
- const usable=items.filter(enhancedAvailable);
+ const usable=items.filter(c=>safeNumber(c.score)!==null&&enhancedAvailable(c));
  return `<div class="benchmark-info">
   <div><strong>${ic('chart',18)} Two engines. One objective.</strong><p>Classic and Enhanced are compared on the <b>same screened candidates</b>. Scores use different methodologies; differences are not an accuracy verdict.</p></div>
   <span class="tiny-badge">${usable.length}/${items.length} comparable</span>
@@ -450,7 +530,7 @@ function benchmarkTable(items){
     const status=enhancedStatus(c);
     const reasonDetails=reasoningAccordion(c,'benchmark');
     return `<div class="bench-row">
-      <div><strong>${esc(c.name||'Unnamed candidate')}</strong><small>${esc(c.current_role||c.location||'Candidate')} · Classic #${rankFor(c,'score')}${b!=null?' / Enhanced #'+rankFor(c,'enhanced_score'):''}</small></div>
+      <div><strong>${esc(c.name||'Unnamed candidate')}</strong><small>${esc(c.current_role||c.location||'Candidate')} · ${a!=null?'Classic #'+rankFor(c,'score'):'Classic unavailable'}${b!=null?' / Enhanced #'+rankFor(c,'enhanced_score'):''}</small></div>
       <div class="bench-score-cell">
         <div class="bench-status-slot" aria-hidden="true"></div>
         <span class="bench-score">${a==null?'—':a.toFixed(1)}</span>
@@ -469,12 +549,20 @@ function benchmarkTable(items){
  </div>
  <p class="footnote">Rank numbers are calculated from the screened list for each engine. Expand “Why this status?” to view the reasons returned by the backend. Missing Enhanced scores are not estimated.</p>`;
 }
-function results(){if(!S.searchComplete)return '';const d=statData(),items=sortAndFilter();return `<section class="analytics" id="results"><div class="section-header"><div><div class="kicker">03 / THE SHORTLIST</div><h2>${S.mode==='benchmark'?'Head-to-head intelligence.':S.mode==='enhanced'?'Deeper signals. Sharper fit.':'Your ranked talent shortlist.'}</h2></div><p>${esc(S.jobTitle||'Current screening')} · ${S.candidates.length} candidate${S.candidates.length===1?'':'s'} <span class="source-indicator">${S.screenSource==='json'?'· JSON batch':'· Database'}</span></p></div>${resultsMetrics()}
- ${S.mode!=='classic'&&d.compared===0&&S.candidates.length?`<div class="notice" style="margin-bottom:18px">No Enhanced scores were returned for this job. Your current backend must persist <code>enhanced_score</code> in screening results. Rerun screening after the backend is updated.</div>`:''}
+function results(){if(!S.searchComplete)return '';const d=statData(),items=sortAndFilter(),visible=items.slice(0,S.visibleCount);return `<section class="analytics" id="results"><div class="section-header"><div><div class="kicker">03 / THE SHORTLIST</div><h2>${S.mode==='benchmark'?'Head-to-head intelligence.':S.mode==='enhanced'?'Deeper signals. Sharper fit.':'Your ranked talent shortlist.'}</h2></div><p>${esc(S.jobTitle||'Current screening')} · ${S.candidates.length} candidate${S.candidates.length===1?'':'s'} <span class="source-indicator">${S.screenSource==='json'?'· JSON batch':'· Database'}</span></p></div>${resultsMetrics()}
+ ${S.mode!=='classic'&&d.available.length===0&&S.candidates.length?`<div class="notice" style="margin-bottom:18px">No Enhanced scores were returned by this screening run. Check Enhanced scoring logs, then try again.</div>`:''}
  <div class="results-toolbar"><div class="inline"><div class="kicker">${S.mode==='benchmark'?'BENCHMARK COMPARISON':'CANDIDATE PROFILES'}</div><span class="tiny-badge neutral">${items.length} shown</span></div><div class="filter-controls"><label class="search-box">${ic('search',15)}<input aria-label="Search candidates" id="csearch" placeholder="Search name, role, city…" value="${esc(S.query)}" oninput="S.query=this.value;updateResults()"/></label><select class="select" aria-label="Sort candidates" onchange="S.sort=this.value;updateResults()"><option value="score" ${S.sort==='score'?'selected':''}>Sort: Top score</option><option value="name" ${S.sort==='name'?'selected':''}>Sort: Name</option>${S.mode==='benchmark'?`<option value="delta" ${S.sort==='delta'?'selected':''}>Sort: Biggest difference</option>`:''}</select></div></div>
- <div id="result-content">${items.length?(S.mode==='benchmark'?benchmarkTable(items):`<div class="cand-grid">${items.map(candidateCard).join('')}</div>`):`<div class="empty-list">No candidates match your search.</div>`}</div>
+ <div id="result-content">${visible.length?(S.mode==='benchmark'?benchmarkTable(visible):`<div class="cand-grid">${visible.map(candidateCard).join('')}</div>`):`<div class="empty-list">No candidates match your search.</div>`}</div>
+ <div class="load-cta" id="load-more-results">${items.length>S.visibleCount?`<button class="btn secondary" onclick="loadMore()">Load 50 more (${visible.length} of ${items.length} shown) ${ic('arrow',15)}</button>`:''}</div>
  <div class="load-cta" style="margin-top:20px"><button class="btn ghost" onclick="resetSearch()">${ic('reset',15)} New search</button>${S.candidates.length?`<span class="hint">Review profiles before contacting candidates. WhatsApp invites require confirmation.</span>`:''}</div></section>`;}
-function updateResults(){const f=document.getElementById('result-content');if(!f)return;const items=sortAndFilter();f.innerHTML=items.length?(S.mode==='benchmark'?benchmarkTable(items):`<div class="cand-grid">${items.map(candidateCard).join('')}</div>`):'<div class="empty-list">No candidates match your search.</div>' ;}
+function updateResults(){
+ const target=document.getElementById('result-content');if(!target)return;
+ const items=sortAndFilter(),visible=items.slice(0,S.visibleCount);
+ target.innerHTML=visible.length?(S.mode==='benchmark'?benchmarkTable(visible):`<div class="cand-grid">${visible.map(candidateCard).join('')}</div>`):'<div class="empty-list">No candidates match your search.</div>';
+ const more=document.getElementById('load-more-results');
+ if(more)more.innerHTML=items.length>S.visibleCount?`<button class="btn secondary" onclick="loadMore()">Load 50 more (${visible.length} of ${items.length} shown) ${ic('arrow',15)}</button>`:'';
+}
+function loadMore(){S.visibleCount+=50;updateResults();}
 function renderLogin(){return `<div class="shell">${nav()}<main class="main">${hero()}<section style="max-width:465px;margin:55px auto" class="panel"><div class="panel-pad"><div class="eyebrow">SECURE RECRUITER ACCESS</div><h2 style="font:800 28px Manrope;letter-spacing:-.04em">Welcome back.</h2><p class="muted" style="margin-bottom:28px">Sign in to open your talent intelligence workspace.</p>${S.error?`<div class="error">${esc(S.error)}</div>`:''}<form onsubmit="event.preventDefault();doLogin()"><label for="email" class="input-label">Work email</label><input id="email" type="email" class="field" placeholder="you@company.com" required autocomplete="username"/><label class="input-label" for="password">Password</label><input id="password" class="field" type="password" required autocomplete="current-password" placeholder="Enter your password"/><button type="submit" class="btn primary full" style="margin-top:24px">Enter Match Studio ${ic('arrow',16)}</button></form></div></section></main></div>`;}
 async function doLogin(){const email=document.getElementById('email')?.value?.trim()||'',pass=document.getElementById('password')?.value||'';if(!email||!pass)return;try{await API.login(email,pass);S.error='';render();}catch(e){S.error=e.message||'Login failed';render();}}
 function render(){const a=document.getElementById('app');if(!getToken()){a.innerHTML=renderLogin();return;}const el=document.activeElement;const focus=el?.id,position=el&&typeof el.selectionStart==='number'?el.selectionStart:null;a.innerHTML=`<div class="shell">${nav()}<main class="main">${hero()}${steps()}${modes()}${S.error?`<div class="error" role="alert">${esc(S.error)}</div>`:''}<div class="workspace">${intakePanel()}${rightPanel()}</div>${results()}<footer class="footer"><div><strong>NMHireXV2</strong> / Match Studio <span style="color:#70819d">· From requirements to real potential.</span></div><div>Classic <span style="color:var(--mint)">•</span> Enhanced <span style="color:var(--mint)">•</span> Benchmark</div></footer></main></div>`;if(focus&&position!=null){const target=document.getElementById(focus);if(target&&!target.disabled){target.focus();try{target.setSelectionRange(position,position);}catch{}}}}
