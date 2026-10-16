@@ -13,10 +13,16 @@ Recruiter approval:
 """
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from urllib.parse import urlsplit
+
+from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.concurrency import run_in_threadpool
 from uuid import UUID
 from datetime import datetime, timezone
 
 from pydantic import BaseModel
+from fastapi.responses import JSONResponse
 from fastapi import (
     APIRouter,
     Depends,
@@ -57,6 +63,7 @@ from app.services.tool_functions import (
     get_admin_jobs,
     get_admin_job_candidates,
     read_file,
+    extract_jd,
     get_user_dashboard,
     mark_candidate_contacted,
     get_all_candidates,
@@ -66,7 +73,6 @@ from app.services.tool_functions import (
 
 
 router = APIRouter(prefix="/api")
-
 
 # ============================================================
 # AUTHENTICATION
@@ -810,6 +816,7 @@ async def api_screen_batch(
             
             "enhanced_score": res["final_score"],
             "enhanced_classification": res["recommendation_status"],
+            
             "enhanced_breakdown": res["score_breakdown"],
             "reasoning": res["recommendation_reason"]
         })
@@ -817,9 +824,282 @@ async def api_screen_batch(
     return {
         "job_id": str(job.id),
         "source": "json_batch",
+        
         "candidates_evaluated": len(adapted_candidates),
         "candidates": ui_results
     }
+
+
+@router.post("/jobs/{job_id}/screen-batch/shortlist", status_code=201)
+async def api_json_batch_shortlist(
+    job_id: UUID,
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Independently score an uploaded Naukri JSON batch using Enhanced scoring."""
+
+    def failed(message: str):
+        return JSONResponse(
+            status_code=410,
+            content={"status": "fail", "status_code": 410, "message": message},
+        )
+
+    job = db.get(Job, job_id)
+    if not job or not job.requirements:
+        return failed("That job description seems to have vanished. Quite the hiring strategy.")
+    if user.role != "ADMIN" and job.created_by != user.id:
+        raise HTTPException(status_code=403, detail="You do not have access to this job")
+    if user.role == "RECRUITER" and user.status != "APPROVED":
+        raise HTTPException(status_code=403, detail="Recruiter account is not approved")
+
+    try:
+        contents = await file.read(10 * 1024 * 1024 + 1)
+        if len(contents) > 10 * 1024 * 1024:
+            return failed("Over 10 MB of JSON? Ambitious. Please upload a smaller file.")
+        payload = json.loads(contents)
+        if not isinstance(payload, dict) or not isinstance(payload.get("candidates"), list):
+            return failed('Apparently the JSON missed the memo: it needs a "candidates" array.')
+        raw_candidates = payload["candidates"]
+        if any(not isinstance(c, dict) for c in raw_candidates):
+            return failed("Candidate records should be objects. This is JSON, not a guessing game.")
+
+        # The input JSON owns profileUrl; join it to scored results via candidateId.
+        candidate_ids = [str(c.get("candidateId") or "").strip() for c in raw_candidates]
+        if any(not cid for cid in candidate_ids) or len(set(candidate_ids)) != len(candidate_ids):
+            return failed("Missing or duplicate candidateId values. Even a shortlist needs identities.")
+
+        if not raw_candidates:
+            return {
+                "status": "success", "status_code": 201,
+                "message": "No one shortlisted. Apparently the candidates decided 75+ was optional.",
+            }
+
+        # EXACTLY the same adapter and JD fields as the existing /screen-batch API.
+        adapted_candidates = [adapt_naukri_candidate(c) for c in raw_candidates]
+        req = job.requirements
+        jd_dict = {
+            "job_title": req.job_title,
+            "minimum_experience": float(req.minimum_experience) if req.minimum_experience is not None else None,
+            "maximum_experience": float(req.maximum_experience) if req.maximum_experience is not None else None,
+            "mandatory_skills": req.mandatory_skills or [],
+            "preferred_skills": req.preferred_skills or [],
+            "education": req.education or [],
+            "certifications": req.certifications or [],
+            "domain": ", ".join(req.domains) if req.domains else "",
+            "location": req.location,
+            "work_mode": req.work_mode,
+            "jd_text_description": job.description or job.jd_raw_text or "",
+        }
+        scored_results = score_candidates(jd=jd_dict, candidates=adapted_candidates, debug=True)
+        original_by_id = {str(c["candidateId"]): c for c in raw_candidates}
+        shortlisted = []
+
+        for result in scored_results:
+            classification = str(result.get("recommendation_status") or "").strip().lower()
+            score = float(result.get("final_score") or 0)
+            if classification not in {"recommended", "review"} or score <= 75:
+                continue
+            original = original_by_id.get(str(result["candidate_id"]), {})
+            profile_url = original.get("profileUrl")
+            if not isinstance(profile_url, str) or not profile_url.strip().lower().startswith(("http://", "https://")):
+                return failed("A top candidate has no usable profileUrl. That is one way to stay mysterious.")
+            shortlisted.append({
+                "name": result["candidate_name"],
+                "profile_url": profile_url,
+            })
+
+        if not shortlisted:
+            return {
+                "status": "success", "status_code": 201,
+                "message": "No one shortlisted. Apparently the candidates decided 75+ was optional.",
+            }
+        return {
+            "status": "success", "status_code": 201,
+            "message": f"Well, would you look at that. {len(shortlisted)} candidate(s) actually made the cut.",
+            "shortlisted_candidates": shortlisted,
+        }
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return failed("Invalid JSON. The brackets and commas have officially stopped cooperating.")
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Independent JSON shortlist screening failed")
+        return failed("The screening engine stumbled. Even the machines are having a Monday. Check server logs.")
+
+
+# ============================================================
+# PUBLIC TWO-INPUT ENHANCED SHORTLIST (NO JOB ID OR AUTH)
+# ============================================================
+
+@router.post("/screen-batch/shortlist", status_code=201)
+async def api_standalone_shortlist(request: Request):
+    """Accept exactly jd + candidates, as text or files, and return shortlisted profiles."""
+    import logging
+
+    def failed(message: str):
+        return JSONResponse(
+            status_code=410,
+            content={"status": "fail", "status_code": 410, "message": message},
+        )
+
+    MAX_BYTES = 10 * 1024 * 1024
+    MAX_CANDIDATES = 250
+
+    try:
+        content_type = request.headers.get("content-type", "").lower()
+        if content_type.startswith("application/json"):
+            # All-text callers may also use a JSON object with exactly two keys.
+            if int(request.headers.get("content-length", "0") or 0) > 2 * MAX_BYTES:
+                return failed("That payload is enormous. Even the AI has boundaries: 20 MB maximum.")
+            raw_body = await request.body()
+            if len(raw_body) > 2 * MAX_BYTES:
+                return failed("That payload is enormous. Even the AI has boundaries: 20 MB maximum.")
+            body = json.loads(raw_body)
+            if not isinstance(body, dict) or set(body) != {"jd", "candidates"}:
+                return failed('Exactly two keys are required: "jd" and "candidates". No bonus entries.')
+            jd_value = body["jd"]
+            candidate_value = body["candidates"]
+        elif content_type.startswith("multipart/form-data"):
+            if int(request.headers.get("content-length", "0") or 0) > 2 * MAX_BYTES + 1024 * 1024:
+                return failed("That upload is enormous. Even the AI has boundaries: 10 MB per input.")
+            async with request.form(max_files=2, max_fields=2, max_part_size=MAX_BYTES) as form:
+                if set(form.keys()) != {"jd", "candidates"} or any(len(form.getlist(k)) != 1 for k in form):
+                    return failed('Exactly two fields are required: "jd" and "candidates". No mystery extras.')
+                jd_value = form["jd"]
+                candidate_value = form["candidates"]
+                # Consume uploaded parts before the form closes.
+                if isinstance(jd_value, StarletteUploadFile):
+                    jd_name = jd_value.filename or ""
+                    jd_value = (jd_name, await jd_value.read(MAX_BYTES + 1))
+                if isinstance(candidate_value, StarletteUploadFile):
+                    candidate_name = candidate_value.filename or ""
+                    candidate_value = (candidate_name, await candidate_value.read(MAX_BYTES + 1))
+        else:
+            return failed("Please use multipart/form-data, or application/json for two text inputs.")
+
+        # Accept a text JD or a PDF/DOCX/TXT file in the very same 'jd' field.
+        if isinstance(jd_value, tuple):
+            filename, raw_jd = jd_value
+            if len(raw_jd) > MAX_BYTES:
+                return failed("JD exceeds 10 MB. A novel is not a job description.")
+            suffix = Path(filename).suffix.lower()
+            if suffix not in {".pdf", ".docx", ".txt"}:
+                return failed("Unsupported JD file. Use PDF, DOCX, or TXT.")
+            with TemporaryDirectory(prefix="nmhirex-jd-") as tmp:
+                temp_path = Path(tmp) / ("uploaded-jd" + suffix)
+                temp_path.write_bytes(raw_jd)
+                jd_text = await run_in_threadpool(read_file, str(temp_path))
+        elif isinstance(jd_value, str):
+            jd_text = jd_value
+        else:
+            return failed("The JD must be plain text or a PDF, DOCX, or TXT file.")
+
+        jd_text = jd_text.strip()
+        if not jd_text:
+            return failed("A blank job description? The candidates would love those requirements.")
+        if len(jd_text) > 30000:
+            return failed("JD exceeds 30,000 characters. Please trim it before screening.")
+
+        # Candidate JSON can be the original JSON object, a JSON string, or a .json upload.
+        if isinstance(candidate_value, tuple):
+            filename, candidate_bytes = candidate_value
+            if Path(filename).suffix.lower() != ".json":
+                return failed("Candidate uploads must be .json files. Plot twist: PDFs are not JSON.")
+            if len(candidate_bytes) > MAX_BYTES:
+                return failed("Candidate JSON exceeds 10 MB. Please divide the candidate batch.")
+            candidate_payload = json.loads(candidate_bytes)
+        elif isinstance(candidate_value, str):
+            if len(candidate_value.encode("utf-8")) > MAX_BYTES:
+                return failed("Candidate JSON exceeds 10 MB. Please divide the candidate batch.")
+            candidate_payload = json.loads(candidate_value)
+        elif isinstance(candidate_value, dict):
+            candidate_payload = candidate_value
+        else:
+            return failed('The "candidates" field must contain JSON text, a JSON object, or a .json file.')
+
+        if not isinstance(candidate_payload, dict) or not isinstance(candidate_payload.get("candidates"), list):
+            return failed('Candidate JSON needs a "candidates" array. Apparently the array took a day off.')
+        raw_candidates = candidate_payload["candidates"]
+        if len(raw_candidates) > MAX_CANDIDATES:
+            return failed(f"Maximum {MAX_CANDIDATES} candidates per request. Even shortlists need limits.")
+        if any(not isinstance(c, dict) for c in raw_candidates):
+            return failed("Every candidate must be a JSON object. Guesswork is not a scoring feature.")
+        ids = [str(c.get("candidateId") or "").strip() for c in raw_candidates]
+        if any(not candidate_id for candidate_id in ids) or len(set(ids)) != len(ids):
+            return failed("Missing or duplicate candidateId values. Even a shortlist needs identities.")
+        if not raw_candidates:
+            return {
+                "status": "success", "status_code": 201,
+                "message": "No one shortlisted. Apparently the candidates decided 75+ was optional.",
+            }
+
+        # Reuse the same extractor that POST /api/jobs invokes inside create_job.
+        extracted = await run_in_threadpool(extract_jd, jd_text)
+        if not isinstance(extracted, dict):
+            raise ValueError("JD extractor did not return a JSON object")
+
+        def optional_number(value):
+            if isinstance(value, dict):
+                value = value.get("max", value.get("min", value.get("value")))
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        jd_dict = {
+            "job_title": extracted.get("job_title"),
+            "minimum_experience": optional_number(extracted.get("min_experience_years")),
+            "maximum_experience": optional_number(extracted.get("max_experience_years")),
+            "mandatory_skills": extracted.get("mandatory_skills") or [],
+            "preferred_skills": extracted.get("preferred_skills") or [],
+            "education": extracted.get("education") or [],
+            "certifications": extracted.get("certifications") or [],
+            "domain": ", ".join(extracted.get("domains") or []),
+            "location": extracted.get("location"),
+            "work_mode": extracted.get("work_mode"),
+            "jd_text_description": jd_text,
+        }
+        adapted_candidates = [adapt_naukri_candidate(c) for c in raw_candidates]
+        scored_results = await run_in_threadpool(
+            score_candidates, jd=jd_dict, candidates=adapted_candidates, debug=True
+        )
+        source_by_id = {str(c["candidateId"]): c for c in raw_candidates}
+        shortlist = []
+        for result in scored_results:
+            classification = str(result.get("recommendation_status") or "").strip().lower()
+            score = float(result.get("final_score") or 0)
+            if classification not in {"recommended", "review"} or score <= 75:
+                continue
+            source = source_by_id.get(str(result["candidate_id"]), {})
+            profile_url = source.get("profileUrl")
+            if not isinstance(profile_url, str) or not profile_url.strip():
+                return failed("A shortlisted candidate is missing profileUrl. Quite the disappearing act.")
+            parsed_url = urlsplit(profile_url.strip())
+            if parsed_url.scheme not in {"https", "http"} or not parsed_url.netloc:
+                return failed("A shortlisted candidate has an invalid profileUrl. Impressive creativity.")
+            shortlist.append({"name": result["candidate_name"], "profile_url": profile_url})
+
+        if not shortlist:
+            return {
+                "status": "success", "status_code": 201,
+                "message": "No one shortlisted. Apparently the candidates decided 75+ was optional.",
+            }
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "status_code": 200,
+                "message": f"Well, would you look at that. {len(shortlist)} candidate(s) actually made the cut.",
+                "shortlisted_candidates": shortlist,
+            },
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return failed("Invalid JSON. The brackets and commas have officially stopped cooperating.")
+    except Exception:
+        logging.getLogger(__name__).exception("Standalone JD + JSON shortlist failed")
+        return failed("The screening engine stumbled. Even the machines are having a Monday. Check server logs.")
+
+
 
 
 # ============================================================
